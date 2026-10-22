@@ -4,14 +4,19 @@ import { Activity, ArrowUpRight, Bot, Check, CheckCircle2,
       LoaderCircle, Plus, RefreshCw, Send, ShieldCheck, Sparkles,
       X, XCircle, Zap } from "lucide-react";
 import './App.css';
+import { createSessionEpoch, resolveForSession } from './sessionEpoch.js';
 
-const API = 'http://127.0.0.1:8765';
+const API = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8765';
 
 function App() {
+  const [sessionEpoch] = useState(() => createSessionEpoch());
+  const [token, setToken] = useState('');
+  const [loginValue, setLoginValue] = useState('');
+  const [loginError, setLoginError] = useState('');
   const [page, setPage] = useState('Overview');
   const [campaigns, setCampaigns] = useState([]);
   const [posts, setPosts] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [showForm, setShowForm] = useState(false);
@@ -21,58 +26,99 @@ function App() {
     call_to_action: 'Contact Slimes.Hustlers to learn more',
   });
 
-  const request = async (path, options = {}) => {
-    const response = await fetch(`${API}${path}`, {
-      ...options,
-      headers: { 'Content-Type': 'application/json', ...options.headers },
-    });
+  const renderGeneration = sessionEpoch.current();
+  const request = useCallback(async (path, options = {}) => {
+    const generation = renderGeneration;
+    if (!token || !sessionEpoch.isCurrent(generation)) {
+      throw new Error('Your session changed. Please sign in again.');
+    }
+    let response;
+    try {
+      response = await fetch(`${API}${path}`, {
+        ...options,
+        headers: {
+          'Content-Type': 'application/json',
+          ...options.headers,
+          Authorization: `Bearer ${token}`,
+        },
+      });
+    } catch {
+      if (!sessionEpoch.isCurrent(generation)) {
+        throw new Error('Your session changed. Please sign in again.');
+      }
+      throw new Error('Cannot reach the API. Check your connection and API address.');
+    }
+    if (!sessionEpoch.isCurrent(generation)) {
+      throw new Error('Your session changed. Please sign in again.');
+    }
+    if (response.status === 401 || response.status === 403) {
+      sessionEpoch.invalidate();
+      setLoginError('Your session expired or was rejected. Please sign in again.');
+      setToken('');
+      setCampaigns([]);
+      setPosts([]);
+      setShowForm(false);
+      setBusy('');
+      setLoading(false);
+      throw new Error('Your session expired or was rejected. Please log in again.');
+    }
     const data = await response.json().catch(() => ({}));
+    if (!sessionEpoch.isCurrent(generation)) {
+      throw new Error('Your session changed. Please sign in again.');
+    }
     if (!response.ok) {
       throw new Error(data.detail || `Request failed (${response.status})`);
     }
     return data;
-  };
+  }, [renderGeneration, sessionEpoch, token]);
 
   const refresh = useCallback(async () => {
+    const generation = renderGeneration;
+    if (!sessionEpoch.isCurrent(generation)) return;
     setLoading(true);
     setError('');
     try {
-      const [campaignData, postData] = await Promise.all([
+      const result = await resolveForSession(sessionEpoch, generation, Promise.all([
         request('/campaigns'),
         request('/posts'),
-      ]);
+      ]));
+      if (!result.current) return;
+      const [campaignData, postData] = result.value;
       setCampaigns(campaignData);
       setPosts(postData);
     } catch (err) {
-      setError(`${err.message}. Confirm that the FastAPI backend is running on port 8765.`);
+      if (sessionEpoch.isCurrent(generation)) setError(err.message);
     } finally {
-      setLoading(false);
+      if (sessionEpoch.isCurrent(generation)) setLoading(false);
     }
-  }, []);
+  }, [renderGeneration, request, sessionEpoch]);
 
   
 useEffect(() => {
+  if (!token) return undefined;
+  const generation = sessionEpoch.current();
   let cancelled = false;
 
   async function loadInitialData() {
     try {
-      const [campaignData, postData] = await Promise.all([
+      const result = await resolveForSession(sessionEpoch, generation, Promise.all([
         request('/campaigns'),
         request('/posts'),
-      ]);
+      ]));
 
-      if (!cancelled) {
+      if (!cancelled && result.current) {
+        const [campaignData, postData] = result.value;
         setCampaigns(campaignData);
         setPosts(postData);
       }
     } catch (err) {
-      if (!cancelled) {
+      if (!cancelled && sessionEpoch.isCurrent(generation)) {
         setError(
-          `${err.message}. Confirm that the FastAPI backend is running on port 8765.`
+          err.message
         );
       }
     } finally {
-      if (!cancelled) {
+      if (!cancelled && sessionEpoch.isCurrent(generation)) {
         setLoading(false);
       }
     }
@@ -83,7 +129,49 @@ useEffect(() => {
   return () => {
     cancelled = true;
   };
-}, []);
+}, [request, sessionEpoch, token]);
+
+  async function login(event) {
+    event.preventDefault();
+    const generation = sessionEpoch.invalidate();
+    setLoginError('');
+    try {
+      const response = await fetch(`${API}/campaigns`, {
+        headers: { Authorization: `Bearer ${loginValue}` },
+      });
+      if (!sessionEpoch.isCurrent(generation)) return;
+      if (response.status === 401 || response.status === 403) {
+        setLoginError('That access secret was not accepted.');
+        return;
+      }
+      if (!response.ok) {
+        setLoginError(response.status === 503
+          ? 'The server authentication is not configured correctly.'
+          : `The API returned an error (${response.status}).`);
+        return;
+      }
+      setToken(loginValue);
+      setLoginValue('');
+      setLoginError('');
+      setLoading(true);
+    } catch {
+      if (sessionEpoch.isCurrent(generation)) {
+        setLoginError('Cannot reach the API. Check your connection and API address.');
+      }
+    }
+  }
+
+  function logout() {
+    sessionEpoch.invalidate();
+    setToken('');
+    setCampaigns([]);
+    setPosts([]);
+    setShowForm(false);
+    setBusy('');
+    setLoading(false);
+    setError('');
+    setNotice('');
+  }
 
 
 const pending = posts.filter((post) => post.status === 'PENDING_APPROVAL');
@@ -100,6 +188,8 @@ const templateCount = posts.filter(
 
   async function createCampaign(event) {
     event.preventDefault();
+    const generation = renderGeneration;
+    if (!sessionEpoch.isCurrent(generation)) return;
     setBusy('create');
     setError('');
     try {
@@ -107,9 +197,11 @@ const templateCount = posts.filter(
         method: 'POST',
         body: JSON.stringify(form),
       });
+      if (!sessionEpoch.isCurrent(generation)) return;
       await request(`/campaigns/${campaign.campaign_id}/drafts`, {
         method: 'POST',
       });
+      if (!sessionEpoch.isCurrent(generation)) return;
       setNotice('Campaign created. LinkedIn and Facebook drafts are ready for review.');
       setForm({
         name: '', objective: '', audience: '', offer: '',
@@ -119,30 +211,44 @@ const templateCount = posts.filter(
       setPage('Drafts');
       await refresh();
     } catch (err) {
-      setError(err.message);
+      if (sessionEpoch.isCurrent(generation)) setError(err.message);
     } finally {
-      setBusy('');
+      if (sessionEpoch.isCurrent(generation)) setBusy('');
     }
   }
 
   async function reviewPost(post, action) {
+    const generation = renderGeneration;
+    if (!sessionEpoch.isCurrent(generation)) return;
     setBusy(post.post_id);
     setError('');
     setNotice('');
     try {
       await request(`/posts/${post.post_id}/${action}`, { method: 'POST' });
+      if (!sessionEpoch.isCurrent(generation)) return;
       setNotice(`Post ${action === 'approve' ? 'approved' : 'rejected'} successfully.`);
       await refresh();
     } catch (err) {
-      setError(err.message);
+      if (sessionEpoch.isCurrent(generation)) setError(err.message);
     } finally {
-      setBusy('');
+      if (sessionEpoch.isCurrent(generation)) setBusy('');
     }
   }
 
   const visiblePosts = page === 'Drafts'
     ? posts
     : pending;
+
+  if (!token) {
+    return <main className="login-screen"><form className="campaign-modal login-card" onSubmit={login}>
+      <div className="eyebrow"><ShieldCheck size={14} /> PRIVATE WORKSPACE</div>
+      <h1>Sign in to your workspace</h1>
+      <p>Enter the access secret supplied by your administrator.</p>
+      {loginError && <div className="alert error-alert" role="alert">{loginError}</div>}
+      <label>Access secret<input type="password" autoComplete="off" required value={loginValue} onChange={(event) => setLoginValue(event.target.value)} /></label>
+      <button className="primary-button" type="submit">Sign in</button>
+    </form></main>;
+  }
 
   return (
     <div className="app-shell">
@@ -190,6 +296,7 @@ const templateCount = posts.filter(
           <div className="topbar-right">
             <span className="connection"><span className={`status-dot ${error ? 'offline' : ''}`} /> {error ? 'Connection issue' : 'API workspace'}</span>
             <button className="icon-button" title="Refresh data" onClick={refresh}><RefreshCw size={17} /></button>
+            <button className="secondary-button" onClick={logout}>Log out</button>
           </div>
         </header>
 

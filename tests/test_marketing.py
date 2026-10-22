@@ -1,15 +1,30 @@
 ﻿import pytest
 from fastapi.testclient import TestClient
+import asyncio
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
-from src.marketing import ai_generator, service
-from src.api.main import app
 
-client = TestClient(app)
+os.environ["APP_ENV"] = "development"
+
+from src.marketing import ai_generator, service
+from src.api.main import (
+    RequestBodyLimitMiddleware,
+    _production_origins,
+    app,
+    validate_runtime_config,
+)
+
+TEST_SECRET = "test-only-secret-with-at-least-32-bytes-long"
+client = TestClient(app, headers={"Authorization": f"Bearer {TEST_SECRET}"})
 
 
 @pytest.fixture(autouse=True)
 def isolated_database(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_ENV", "development")
     monkeypatch.setenv("MARKETING_DB_PATH", str(tmp_path / "marketing-test.db"))
+    monkeypatch.setenv("MARKETING_AUTH_SECRET", TEST_SECRET)
     monkeypatch.setenv("MARKETING_AI_ENABLED", "false")
     monkeypatch.setenv("AI_ENABLED", "false")
 
@@ -35,12 +50,91 @@ def test_health_endpoint():
     assert response.json()["status"] == "ok"
 
 
+@pytest.mark.parametrize("method,path", [
+    ("POST", "/campaigns"),
+    ("GET", "/campaigns"),
+    ("GET", "/campaigns/CMP-UNKNOWN"),
+    ("POST", "/campaigns/CMP-UNKNOWN/drafts"),
+    ("GET", "/posts"),
+    ("POST", "/posts/PST-UNKNOWN/approve"),
+    ("POST", "/posts/PST-UNKNOWN/reject"),
+])
+def test_every_protected_route_rejects_missing_or_invalid_auth(method, path):
+    unauthenticated = TestClient(app)
+    missing = unauthenticated.request(method, path, json={} if method == "POST" and path == "/campaigns" else None)
+    invalid = unauthenticated.request(
+        method, path,
+        headers={"Authorization": "Bearer invalid"},
+        json={} if method == "POST" and path == "/campaigns" else None,
+    )
+    assert missing.status_code == 401
+    assert invalid.status_code == 401
+
+
+def test_unauthorized_requests_cannot_create_or_review_data():
+    campaign = create_test_campaign()
+    posts = client.post(f"/campaigns/{campaign['campaign_id']}/drafts").json()
+    post_id = posts[0]["post_id"]
+    unauthenticated = TestClient(app)
+
+    assert unauthenticated.post("/campaigns", json={
+        "name": "Unauthorized", "objective": "Should not persist", "audience": "Nobody"
+    }).status_code == 401
+    assert unauthenticated.post(f"/posts/{post_id}/approve").status_code == 401
+    assert unauthenticated.post(f"/posts/{post_id}/reject").status_code == 401
+    assert unauthenticated.get("/campaigns").status_code == 401
+    assert unauthenticated.get("/posts").status_code == 401
+    assert len(client.get("/campaigns").json()) == 1
+    assert client.get("/posts").json()[0]["status"] == "PENDING_APPROVAL"
+
+
+def test_health_is_public_and_auth_configuration_fails_closed(monkeypatch):
+    monkeypatch.delenv("MARKETING_AUTH_SECRET")
+    assert client.get("/health").status_code == 200
+    assert client.get("/campaigns").status_code == 503
+
+
+def test_undersized_auth_secret_fails_closed(monkeypatch):
+    monkeypatch.setenv("MARKETING_AUTH_SECRET", "too-short")
+    assert client.get("/campaigns").status_code == 503
+
+
+def test_cors_allows_development_origin_and_rejects_unlisted_origin():
+    allowed = client.options("/campaigns", headers={
+        "Origin": "http://localhost:5173",
+        "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "authorization",
+    })
+    denied = client.options("/campaigns", headers={
+        "Origin": "https://unlisted.example",
+        "Access-Control-Request-Method": "GET",
+    })
+    assert allowed.status_code == 200
+    assert allowed.headers.get("access-control-allow-origin") == "http://localhost:5173"
+    assert "authorization" in allowed.headers.get("access-control-allow-headers", "").lower()
+    assert "origin" in allowed.headers.get("vary", "").lower()
+    assert denied.headers.get("access-control-allow-origin") is None
+    assert denied.status_code == 400
+
+
 def test_create_campaign_and_list_it():
     campaign = create_test_campaign()
     assert campaign["name"] == "October AI awareness"
     response = client.get("/campaigns")
     assert response.status_code == 200
     assert any(item["campaign_id"] == campaign["campaign_id"] for item in response.json())
+
+
+def test_database_path_creates_parent_and_preserves_existing_campaign(tmp_path, monkeypatch):
+    database_path = tmp_path / "mounted-volume" / "marketing.db"
+    monkeypatch.setenv("MARKETING_DB_PATH", str(database_path))
+    original = service.create_campaign("Persistent", "Keep this", "Pilot user")
+
+    # Reopening the configured path initializes idempotently without replacing data.
+    with service._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM campaigns").fetchone()[0] == 1
+    assert database_path.exists()
+    assert service.get_campaign(original["campaign_id"])["name"] == "Persistent"
 
 
 def test_campaign_requires_core_fields():
@@ -118,8 +212,9 @@ def test_gemini_generator_returns_ai_content(monkeypatch):
             return SimpleNamespace(text=expected_content)
 
     class FakeClient:
-        def __init__(self, api_key):
+        def __init__(self, api_key, http_options):
             assert api_key == "test-key"
+            assert http_options.timeout == 20000
             self.models = FakeModels()
 
         def close(self):
@@ -169,3 +264,320 @@ def test_template_fallback_is_used_when_ai_returns_none(monkeypatch):
     assert "Looking for smarter ways to run your business?" in (
         linkedin_post["content"]
     )
+
+
+def run_body_middleware(chunks, headers=()):
+    async def exercise():
+        incoming = iter(chunks)
+        sent = []
+        downstream_body = bytearray()
+        receive_calls = 0
+
+        async def receive():
+            nonlocal receive_calls
+            receive_calls += 1
+            return next(incoming)
+
+        async def send(message):
+            sent.append(message)
+
+        async def downstream(_scope, downstream_receive, downstream_send):
+            while True:
+                message = await downstream_receive()
+                downstream_body.extend(message.get("body", b""))
+                if not message.get("more_body", False):
+                    break
+            await downstream_send({"type": "http.response.start", "status": 200, "headers": []})
+            await downstream_send({"type": "http.response.body", "body": b"ok"})
+
+        middleware = RequestBodyLimitMiddleware(downstream, max_body_size=32)
+        await middleware({"type": "http", "headers": list(headers)}, receive, send)
+        return sent, bytes(downstream_body), receive_calls
+
+    return asyncio.run(exercise())
+
+
+def test_body_limit_rejects_oversized_accurate_content_length_without_reading_body():
+    sent, _, receive_calls = run_body_middleware(
+        [{"type": "http.request", "body": b"x" * 33, "more_body": False}],
+        [(b"content-length", b"33")],
+    )
+    assert sent[0]["status"] == 413
+    assert receive_calls == 0
+
+
+@pytest.mark.parametrize("headers", [
+    (),
+    ((b"content-length", b"4"),),
+])
+def test_body_limit_rejects_oversized_chunked_or_inaccurate_length(headers):
+    sent, _, _ = run_body_middleware([
+        {"type": "http.request", "body": b"a" * 20, "more_body": True},
+        {"type": "http.request", "body": b"b" * 13, "more_body": True},
+    ], headers)
+    assert sent[0]["status"] == 413
+    assert sent[1]["body"] == b'{"detail":"Request body too large."}'
+
+
+def test_body_limit_forwards_normal_sized_json_to_api_route():
+    response = client.post("/campaigns", json={
+        "name": "Normal request",
+        "objective": "Verify bounded request forwarding",
+        "audience": "Pilot user",
+    })
+    assert response.status_code == 201
+
+
+def test_body_limit_forwards_normal_sized_body_to_downstream():
+    payload = b'{"name":"test"}'
+    sent, body, _ = run_body_middleware([
+        {"type": "http.request", "body": payload, "more_body": False},
+    ], [(b"content-length", str(len(payload)).encode("ascii"))])
+    assert body == payload
+    assert sent[0]["status"] == 200
+
+
+def test_body_limit_returns_cleanly_on_client_disconnect():
+    sent, _, _ = run_body_middleware([
+        {"type": "http.disconnect"},
+    ])
+    assert sent == []
+
+
+def test_production_cors_rejects_wildcard_origin():
+    environment = dict(os.environ)
+    environment.update({"APP_ENV": "production", "CORS_ALLOWED_ORIGINS": "*"})
+    result = subprocess.run(
+        [sys.executable, "-c", "import src.api.main"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "exact origins" in result.stderr
+
+
+@pytest.mark.parametrize("origin", [
+    "http://app.example.com",
+    "https://app.example.com/",
+    "https://app.example.com/path",
+    "https://app.example.com?query=1",
+    "https://app.example.com#fragment",
+    "https://user:password@app.example.com",
+    "https://app.example.com:99999",
+    "https://app.example.com:",
+    "https://localhost",
+    "https://127.0.0.2",
+    "not-an-origin",
+    "https://bad host.example",
+])
+def test_production_cors_rejects_non_exact_or_non_https_origins(origin):
+    with pytest.raises(RuntimeError):
+        _production_origins(origin)
+
+
+def test_production_cors_canonicalizes_valid_https_origins():
+    assert _production_origins("https://APP.example.com,https://api.example.com:443") == [
+        "https://app.example.com",
+        "https://api.example.com",
+    ]
+
+
+def test_production_cors_rejects_wildcard_origin_directly():
+    with pytest.raises(RuntimeError, match="exact origins"):
+        _production_origins("*")
+
+
+def test_production_cors_preflight_uses_canonical_allowed_origins(tmp_path):
+    environment = dict(os.environ)
+    environment.update({
+        "APP_ENV": "production",
+        "MARKETING_AUTH_SECRET": TEST_SECRET,
+        "MARKETING_DB_PATH": str(tmp_path / "marketing.db"),
+        "CORS_ALLOWED_ORIGINS": "https://APP.example.com:443",
+    })
+    result = subprocess.run(
+        [sys.executable, "-c", (
+            "from fastapi.testclient import TestClient\n"
+            "from src.api.main import app\n"
+            "with TestClient(app) as client:\n"
+            " allowed = client.options('/campaigns', headers={"
+            "'Origin': 'https://app.example.com', "
+            "'Access-Control-Request-Method': 'GET', "
+            "'Access-Control-Request-Headers': 'authorization'})\n"
+            " denied = client.options('/campaigns', headers={"
+            "'Origin': 'https://unlisted.example', "
+            "'Access-Control-Request-Method': 'GET'})\n"
+            " assert allowed.status_code == 200\n"
+            " assert allowed.headers.get('access-control-allow-origin') == 'https://app.example.com'\n"
+            " assert denied.status_code == 400\n"
+            " assert denied.headers.get('access-control-allow-origin') is None\n"
+        )],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_production_runtime_configuration_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.delenv("APP_ENV", raising=False)
+    with pytest.raises(RuntimeError, match="APP_ENV"):
+        validate_runtime_config()
+
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("MARKETING_AUTH_SECRET", "short")
+    with pytest.raises(RuntimeError, match="at least 32 bytes"):
+        validate_runtime_config()
+
+    with pytest.raises(RuntimeError, match="MARKETING_AUTH_SECRET"):
+        monkeypatch.delenv("MARKETING_AUTH_SECRET")
+        validate_runtime_config()
+
+    monkeypatch.setenv("MARKETING_AUTH_SECRET", TEST_SECRET)
+    monkeypatch.delenv("MARKETING_DB_PATH", raising=False)
+    with pytest.raises(RuntimeError, match="MARKETING_DB_PATH"):
+        validate_runtime_config()
+
+    monkeypatch.setenv("MARKETING_DB_PATH", "relative/marketing.db")
+    with pytest.raises(RuntimeError, match="absolute path"):
+        validate_runtime_config()
+
+    monkeypatch.setenv("MARKETING_DB_PATH", str(tmp_path / "volume" / "marketing.db"))
+    with pytest.raises(RuntimeError, match="existing writable directory"):
+        validate_runtime_config()
+
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    monkeypatch.setenv("MARKETING_DB_PATH", str(volume / "marketing.db"))
+    monkeypatch.delenv("CORS_ALLOWED_ORIGINS", raising=False)
+    with pytest.raises(RuntimeError, match="CORS_ALLOWED_ORIGINS"):
+        validate_runtime_config()
+
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "https://app.example.com")
+    validate_runtime_config()
+
+
+def test_production_startup_fails_before_serving_when_configuration_is_invalid(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.delenv("MARKETING_AUTH_SECRET", raising=False)
+    with pytest.raises(RuntimeError, match="MARKETING_AUTH_SECRET"):
+        with TestClient(app):
+            pass
+
+
+def test_backend_import_requires_explicit_app_environment():
+    environment = dict(os.environ)
+    environment.pop("APP_ENV", None)
+    result = subprocess.run(
+        [sys.executable, "-c", "import src.api.main"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "APP_ENV must be explicitly set" in result.stderr
+
+
+def test_production_disables_api_documentation_routes():
+    environment = dict(os.environ)
+    environment.update({
+        "APP_ENV": "production",
+        "CORS_ALLOWED_ORIGINS": "https://app.example.com",
+    })
+    result = subprocess.run(
+        [sys.executable, "-c", (
+            "from src.api.main import app; "
+            "assert app.docs_url is None and app.redoc_url is None "
+            "and app.openapi_url is None"
+        )],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_body_limit_rejects_chunked_oversize_without_content_length():
+    async def exercise():
+        body_chunks = iter([
+            {"type": "http.request", "body": b"a" * 800_000, "more_body": True},
+            {"type": "http.request", "body": b"b" * 248_577, "more_body": True},
+        ])
+        sent = []
+        called_app = False
+
+        async def receive():
+            return next(body_chunks)
+
+        async def send(message):
+            sent.append(message)
+
+        async def downstream(_scope, _receive, _send):
+            nonlocal called_app
+            called_app = True
+
+        middleware = RequestBodyLimitMiddleware(downstream)
+        await middleware({"type": "http", "headers": []}, receive, send)
+        assert not called_app
+        assert sent[0]["status"] == 413
+        assert b"".join(message.get("body", b"") for message in sent[1:]) == (
+            b'{"detail":"Request body too large."}'
+        )
+
+    asyncio.run(exercise())
+
+
+def test_gemini_capacity_limit_uses_template_fallback(monkeypatch):
+    monkeypatch.setenv("MARKETING_AI_ENABLED", "true")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    class FullCapacity:
+        def acquire(self, timeout):
+            assert timeout == 1
+            return False
+
+    monkeypatch.setattr(ai_generator, "_generation_slots", FullCapacity())
+    result = ai_generator.generate_ai_draft({
+        "name": "test",
+        "objective": "test objective",
+        "audience": "test audience",
+        "offer": "",
+        "call_to_action": "test CTA",
+    }, "linkedin")
+    assert result is None
+
+
+def test_gemini_provider_errors_fall_back_without_logging_exception_details(
+    monkeypatch, caplog
+):
+    monkeypatch.setenv("MARKETING_AI_ENABLED", "true")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-provider-secret")
+
+    class FakeModels:
+        def generate_content(self, **_kwargs):
+            raise RuntimeError("provider echoed test-provider-secret and private prompt")
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.models = FakeModels()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(ai_generator.genai, "Client", FakeClient)
+    result = ai_generator.generate_ai_draft({
+        "name": "private campaign",
+        "objective": "private objective",
+        "audience": "private audience",
+        "offer": "",
+        "call_to_action": "private CTA",
+    }, "linkedin")
+
+    assert result is None
+    assert "test-provider-secret" not in caplog.text
+    assert "private prompt" not in caplog.text

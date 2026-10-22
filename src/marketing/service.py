@@ -9,7 +9,7 @@ DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "marketing.db"
 
 
 def _connect() -> sqlite3.Connection:
-    db_path = Path(os.getenv("MARKETING_DB_PATH", str(DEFAULT_DB_PATH)))
+    db_path = Path(os.getenv("MARKETING_DB_PATH") or DEFAULT_DB_PATH)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
