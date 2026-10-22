@@ -1,4 +1,4 @@
-﻿import pytest
+import pytest
 from fastapi.testclient import TestClient
 import asyncio
 import os
@@ -581,3 +581,87 @@ def test_gemini_provider_errors_fall_back_without_logging_exception_details(
     assert result is None
     assert "test-provider-secret" not in caplog.text
     assert "private prompt" not in caplog.text
+
+
+def test_gemini_server_error_retries_once_then_returns_ai_content(monkeypatch):
+    from google.genai import errors
+
+    monkeypatch.setenv("MARKETING_AI_ENABLED", "true")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    expected_content = "Useful AI automation ideas. #BusinessAutomation"
+
+    class FakeModels:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_content(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise errors.ServerError(503, {"status": "UNAVAILABLE"})
+            return SimpleNamespace(text=expected_content)
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.models = FakeModels()
+
+        def close(self):
+            pass
+
+    fake_client = FakeClient()
+    monkeypatch.setattr(
+        ai_generator.genai, "Client", lambda **_kwargs: fake_client
+    )
+
+    result = ai_generator.generate_ai_draft({
+        "name": "test",
+        "objective": "test objective",
+        "audience": "test audience",
+        "offer": "",
+        "call_to_action": "test CTA",
+    }, "facebook")
+
+    assert result == expected_content
+    assert fake_client.models.calls == 2
+
+
+def test_gemini_server_error_after_retry_uses_fallback(monkeypatch, caplog):
+    from google.genai import errors
+
+    monkeypatch.setenv("MARKETING_AI_ENABLED", "true")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    class FakeModels:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_content(self, **_kwargs):
+            self.calls += 1
+            raise errors.ServerError(
+                503,
+                {"status": "UNAVAILABLE", "message": "private provider detail"},
+            )
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.models = FakeModels()
+
+        def close(self):
+            pass
+
+    fake_client = FakeClient()
+    monkeypatch.setattr(
+        ai_generator.genai, "Client", lambda **_kwargs: fake_client
+    )
+
+    result = ai_generator.generate_ai_draft({
+        "name": "private campaign",
+        "objective": "private objective",
+        "audience": "private audience",
+        "offer": "",
+        "call_to_action": "private CTA",
+    }, "facebook")
+
+    assert result is None
+    assert fake_client.models.calls == 2
+    assert "private provider detail" not in caplog.text

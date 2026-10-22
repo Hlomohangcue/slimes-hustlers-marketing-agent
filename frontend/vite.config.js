@@ -1,8 +1,12 @@
-import react from '@vitejs/plugin-react'
+﻿import react from '@vitejs/plugin-react'
 import { defineConfig, loadEnv } from 'vite'
 
 export function validateProductionApiUrl(value) {
   if (!value) return 'VITE_API_BASE_URL is required for production builds.'
+
+  // Allow a same-origin API path for deployments using the Nginx reverse proxy.
+  if (value === '/api') return null
+
   try {
     const url = new URL(value)
     const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '')

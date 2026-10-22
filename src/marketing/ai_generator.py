@@ -82,12 +82,32 @@ Rules:
             api_key=api_key,
             http_options=types.HttpOptions(timeout=timeout_ms),
         )
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-        )
-        content = (response.text or "").strip()
-        return content or None
+        # Retry once for a transient Gemini HTTP 5xx server error.
+        from google.genai import errors
+
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                )
+                content = (response.text or "").strip()
+                return content or None
+            except errors.ServerError as exc:
+                if attempt == 0:
+                    logger.warning(
+                        "Gemini server error for %s (HTTP %s); retrying once.",
+                        platform,
+                        exc.code,
+                    )
+                    continue
+                logger.warning(
+                    "Gemini server error for %s (HTTP %s); using template fallback.",
+                    platform,
+                    exc.code,
+                )
+                return None
+        return None
     except Exception as exc:
         logger.warning(
             "Gemini draft generation failed for %s (%s); using template fallback.",

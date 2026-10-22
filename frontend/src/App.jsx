@@ -6,7 +6,7 @@ import { Activity, ArrowUpRight, Bot, Check, CheckCircle2,
 import './App.css';
 import { createSessionEpoch, resolveForSession } from './sessionEpoch.js';
 
-const API = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8765';
+const API = import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.PROD ? '/api' : 'http://127.0.0.1:8765');
 
 function App() {
   const [sessionEpoch] = useState(() => createSessionEpoch());
