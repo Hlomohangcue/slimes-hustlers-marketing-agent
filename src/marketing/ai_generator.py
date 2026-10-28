@@ -1,14 +1,15 @@
 
 import logging
 import os
+import threading
 from typing import Any
 
-from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+_generation_slots = threading.BoundedSemaphore(2)
 
 
 def generate_ai_draft(
@@ -64,20 +65,52 @@ Rules:
 - Return only the post text, without explanations or quotation marks.
 """
 
+    try:
+        timeout_ms = int(os.getenv("GEMINI_TIMEOUT_MS", "20000"))
+    except ValueError:
+        timeout_ms = 20000
+    timeout_ms = min(max(timeout_ms, 1000), 60000)
+    if not _generation_slots.acquire(timeout=1):
+        logger.warning("Gemini capacity reached; using template fallback.")
+        return None
+
     client = None
     try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=timeout_ms),
         )
-        content = (response.text or "").strip()
-        return content or None
-    except Exception:
+        # Retry once for a transient Gemini HTTP 5xx server error.
+        from google.genai import errors
+
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                )
+                content = (response.text or "").strip()
+                return content or None
+            except errors.ServerError as exc:
+                if attempt == 0:
+                    logger.warning(
+                        "Gemini server error for %s (HTTP %s); retrying once.",
+                        platform,
+                        exc.code,
+                    )
+                    continue
+                logger.warning(
+                    "Gemini server error for %s (HTTP %s); using template fallback.",
+                    platform,
+                    exc.code,
+                )
+                return None
+        return None
+    except Exception as exc:
         logger.warning(
-            "Gemini draft generation failed for %s; using template fallback.",
+            "Gemini draft generation failed for %s (%s); using template fallback.",
             platform,
-            exc_info=True,
+            type(exc).__name__,
         )
         return None
     finally:
@@ -85,7 +118,5 @@ Rules:
             try:
                 client.close()
             except Exception:
-                logger.debug(
-                    "Could not close Gemini client.",
-                    exc_info=True,
-                )
+                logger.debug("Could not close Gemini client.")
+        _generation_slots.release()

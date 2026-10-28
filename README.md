@@ -1,115 +1,166 @@
-﻿# Slimes.Hustlers Marketing Agent
+# Slimes.Hustlers Marketing Agent
 
-A local-first marketing campaign and content drafting application for
-Slimes.Hustlers AI Solutions, based in Maseru, Lesotho.
+A single-user campaign planning and content drafting application for
+Slimes.Hustlers AI Solutions. The application stores campaign/post data in
+SQLite and keeps an explicit human review step before any post is approved.
+Approval gates content for an explicit second publishing action. Facebook
+publishing is opt-in and requires server credentials; LinkedIn drafting remains
+draft-only.
 
-## Features
+## Local setup
 
-- Create, list, and retrieve marketing campaigns.
-- Generate LinkedIn and Facebook draft posts using the Gemini API when enabled.
-- Fall back to local templates when AI generation is disabled, the API key
-  is missing, or Gemini generation fails.
-- Persist campaigns and posts in SQLite.
-- Require explicit human approval or rejection before a draft is considered
-  approved.
-- Prevent duplicate draft creation for the same campaign.
-- Record the draft generation source and review status.
-- Provide a React frontend and FastAPI backend.
-
-**Publishing limitation:** This version does not publish posts automatically
-to LinkedIn or Facebook. Approval records a review decision; it does not
-publish the content.
-
-## Requirements
-
-- Python compatible with the installed project dependencies.
-- Node.js and npm.
-- A Gemini API key for AI-powered draft generation.
-
-## Backend setup
-
-Create and activate a virtual environment if you do not already have one:
+Requirements: Python, Node.js, and npm. A Gemini API key is optional; without
+it the app uses local templates.
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-Install the runtime and development dependencies:
-
-```powershell
 python -m pip install -r requirements-dev.txt
-```
-
-Create your local environment file:
-
-```powershell
 Copy-Item .env.example .env
 ```
 
-Edit `.env` and configure:
+Set `APP_ENV=development` and `MARKETING_AUTH_SECRET` in `.env`. The secret
+must be private and randomly generated, with at least 32 bytes. For example,
+generate one with `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
+Do not commit `.env` or expose its values through frontend `VITE_*` variables.
+Set `MARKETING_AI_ENABLED=true` and provide `GEMINI_API_KEY` only if Gemini
+drafting is wanted.
 
-- `MARKETING_AI_ENABLED=true` to enable AI generation.
-- `GEMINI_MODEL=gemini-flash-lite-latest` to select the configured model.
-- `GEMINI_API_KEY` with your own Gemini API key.
+The API reads configuration from process environment variables; it does not
+load `.env` automatically. Load the private root `.env` file into the current
+PowerShell process before starting the API:
 
-Keep `.env` private. Never commit API keys.
+```powershell
+Get-Content .\.env | ForEach-Object {
+    if ($_ -match '^\s*([^#=\s]+)\s*=\s*(.*)\s*$') {
+        $name = $Matches[1]
+        $value = $Matches[2].Trim().Trim('"').Trim("'")
+        [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+    }
+}
+```
 
-Start the backend on port 8765, which matches the frontend API address:
+The snippet sets environment variables in memory without printing secret
+values. Repeat this loading step in each new terminal that starts the API.
+
+Run the API:
 
 ```powershell
 python -m uvicorn src.api.main:app --reload --port 8765
 ```
 
-API documentation: http://127.0.0.1:8765/docs
-
-Health check: http://127.0.0.1:8765/health
-
-## Frontend setup
-
-Open a second terminal:
+In another terminal:
 
 ```powershell
 Set-Location frontend
 npm ci
+Copy-Item .env.example .env.local
 npm run dev
 ```
 
-Open the local URL printed by Vite, usually http://localhost:5173.
+The development frontend uses `http://127.0.0.1:8765` by default. Open the URL
+printed by Vite and enter the server's `MARKETING_AUTH_SECRET` in the login
+screen. The token is held in JavaScript memory only; reloading the page signs
+you out. `/health` is public; all campaign and post routes require the bearer
+token. API docs at `/docs` describe protected operations but cannot execute
+them without authorization.
 
-The frontend currently targets `http://127.0.0.1:8765`. If the backend
-address changes, update the frontend configuration accordingly.
+## Configuration
 
-## Testing
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `MARKETING_AUTH_SECRET` | Yes | Server-only bearer token; at least 32 UTF-8 bytes. No default is provided. |
+| `APP_ENV` | Yes | Must be explicitly `development` or `production`; the API refuses to import or start otherwise. |
+| `CORS_ALLOWED_ORIGINS` | Production | Comma-separated exact browser origins; required in production, wildcard is rejected. |
+| `MARKETING_DB_PATH` | Production | SQLite file path on a persistent mounted volume. |
+| `MARKETING_AI_ENABLED` | No | Enables Gemini generation when true; defaults to false. |
+| `GEMINI_API_KEY` | If AI enabled | Server-side Gemini credential. Keep it out of frontend variables. |
+| `GEMINI_MODEL` | No | Gemini model name. |
+| `GEMINI_TIMEOUT_MS` | No | Per-generation network timeout, bounded to 1,000–60,000 ms; default 20,000. |
+| `FACEBOOK_PAGE_ID` | Facebook publishing | Numeric Meta Page ID used for explicit publishing. |
+| `FACEBOOK_PAGE_ACCESS_TOKEN` | Facebook publishing | Server-side Page access token with permission to publish feed posts. Never place this in a `VITE_*` variable. |
+| `FACEBOOK_PUBLISH_TIMEOUT_MS` | No | Per-publish network timeout, bounded to 1,000–60,000 ms; default 20,000. |
+| `FACEBOOK_GRAPH_API_BASE` | No | HTTPS Graph API base URL; defaults to the current `https://graph.facebook.com/v26.0`. Must use the `graph.facebook.com` host and a `vN` or `vN.N` path. |
+| `VITE_API_BASE_URL` | Production frontend build | Public API URL compiled into the frontend; production build requires a valid absolute HTTPS URL and rejects localhost/loopback. Never place credentials or secrets in any `VITE_*` variable. |
 
-Run backend tests from the project root:
+### Facebook publishing
+
+Facebook publishing is deliberately not automatic. Create a draft, select
+**Approve draft**, then select **Publish to Facebook** for that approved draft.
+The server posts the exact approved content to the configured Page through
+Meta's Graph API and stores the returned external post ID to prevent duplicate
+publishing. Configure `FACEBOOK_PAGE_ID` and `FACEBOOK_PAGE_ACCESS_TOKEN` only
+on the server. Use a Page access token for the target Page. Meta requires the
+user/Page relationship to have `CREATE_CONTENT` task access and the app grant
+for `pages_manage_posts` (plus `pages_manage_metadata`,
+`pages_manage_read_engagement`, and `pages_show_list` for discovery as described
+by Meta). Obtain the Page ID and token from `/me/accounts`; do not rely on a
+personal-profile token. Meta permissions require App Review when the app is live,
+and development-mode access is limited to app roles. Rotate or revoke the token
+using Meta when no longer needed.
+
+The Vite development default is `http://127.0.0.1:8765`. `frontend/.env.example`
+shows the local value. For a production frontend build, set `VITE_API_BASE_URL`
+to the HTTPS API URL in the build environment. The build fails if the variable
+is missing, malformed, non-HTTPS, localhost/loopback, or if secret-like Vite
+variable names are present.
+
+## Production deployment requirements
+
+- Terminate TLS at the ingress, reverse proxy, or hosting platform and redirect
+  HTTP to HTTPS there. The proxy-to-API network should also be private or
+  encrypted. The API does not infer external HTTPS from proxy headers.
+- Supply `APP_ENV=production`, a unique high-entropy randomly generated
+  `MARKETING_AUTH_SECRET` (at least 32 bytes), exact `CORS_ALLOWED_ORIGINS`,
+  and `MARKETING_DB_PATH` through the host's secret/configuration facilities.
+  Never put server credentials in frontend build variables.
+- `MARKETING_DB_PATH` must be absolute, and its parent directory must already
+  exist and be writable at startup. The application cannot verify that the host
+  has mounted durable storage there; verify the volume mapping yourself. The
+  service initializes missing tables; `CREATE TABLE IF NOT EXISTS`
+  preserves an existing database. Ensure the process user can write to the
+  volume and test persistence across a restart before the pilot.
+- Run exactly one API instance with one Uvicorn worker against a SQLite
+  database. The Gemini concurrency limit is two calls per Python process.
+  Do not share this file across concurrent replicas or network filesystems.
+  For horizontal scaling, migrate to a server database first.
+- Place request rate limiting and a request-body limit at the ingress. The
+  application rejects requests declaring bodies over 1 MiB; the ingress must
+  also cap streamed/chunked bodies; no ingress configuration is included here,
+  so deployment enforcement must be verified separately. Gemini generation
+  uses a 20-second default timeout, at most two concurrent calls per process, and falls back to templates
+  when capacity or the provider is unavailable.
+- The shared bearer token is a simple single-user pilot credential: there are
+  no separate accounts, token rotation endpoint, per-user audit identities,
+  or brute-force rate limiter in the application. Restrict API network access
+  and apply rate limiting at the ingress. Rotate by updating the server secret
+  and signing in again.
+
+### SQLite backup and restore
+
+Stop the API before making a file copy so SQLite has no active writes. Copy the
+database file from the mounted volume to encrypted, access-controlled backup
+storage. To restore, stop the API, preserve the current database as a separate
+recovery copy, put the selected backup at `MARKETING_DB_PATH`, verify file
+ownership/permissions, then start the API and check `/health` and authenticated
+campaign/post reads. Retain backups according to the pilot's data-retention
+policy. Do not restore over a running database.
+
+## Checks
+
+From the repository root:
 
 ```powershell
 python -m pytest -q
 ```
 
-Run frontend lint and the production build:
+From `frontend`:
 
 ```powershell
-Set-Location frontend
 npm run lint
+$env:VITE_API_BASE_URL = 'https://api.example.invalid'
 npm run build
-Set-Location ..
 ```
 
-## Configuration and data
-
-- `.env` contains local configuration and secrets.
-- `data/marketing.db` is the default SQLite database.
-- `MARKETING_DB_PATH` can override the database location.
-- `.env.example` documents the expected environment variables.
-
-The local database and generated frontend build output should not be committed.
-
-## Current limitations
-
-- No automatic social media publishing.
-- No production social account authentication or publishing integration.
-- Human review is part of the local workflow; deployment security,
-  authentication, and authorization need separate production review.
-- AI generation depends on Gemini availability and valid configuration.
+`example.invalid` is a documentation-only domain; set the real API URL in the
+deployment build environment.
