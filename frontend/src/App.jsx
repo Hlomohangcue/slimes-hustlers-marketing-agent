@@ -217,6 +217,26 @@ const templateCount = posts.filter(
     }
   }
 
+  async function publishPost(post) {
+    const generation = renderGeneration;
+    if (!sessionEpoch.isCurrent(generation)) return;
+    setBusy(post.post_id);
+    setError('');
+    setNotice('');
+    try {
+      const published = await request(`/posts/${post.post_id}/publish/facebook`, {
+        method: 'POST',
+      });
+      if (!sessionEpoch.isCurrent(generation)) return;
+      setNotice(`Facebook post published successfully (ID: ${published.external_post_id}).`);
+      await refresh();
+    } catch (err) {
+      if (sessionEpoch.isCurrent(generation)) setError(err.message);
+    } finally {
+      if (sessionEpoch.isCurrent(generation)) setBusy('');
+    }
+  }
+
   async function reviewPost(post, action) {
     const generation = renderGeneration;
     if (!sessionEpoch.isCurrent(generation)) return;
@@ -331,7 +351,7 @@ const templateCount = posts.filter(
               </div>
             </section>
 
-            <section className="human-control-banner"><div className="shield-icon"><ShieldCheck size={24} /></div><div><strong>Human approval is always in control</strong><p>Drafts are not published automatically. Review and approve each post before any future publishing integration.</p></div><span className="banner-pill"><Check size={14} /> Approval gate active</span></section>
+            <section className="human-control-banner"><div className="shield-icon"><ShieldCheck size={24} /></div><div><strong>Human approval is always in control</strong><p>Drafts are not published automatically. Approve a Facebook draft first, then publish it with a separate explicit action.</p></div><span className="banner-pill"><Check size={14} /> Approval gate active</span></section>
           </>}
 
           {page === 'Campaigns' && <>
@@ -345,7 +365,7 @@ const templateCount = posts.filter(
             <section className="welcome-row"><div><div className="eyebrow"><ShieldCheck size={14} /> HUMAN REVIEW QUEUE</div><h1>Every post, <span className="gold">your decision.</span></h1><p>Review content before it can be considered for publishing.</p></div><button className="secondary-button" onClick={refresh}><RefreshCw size={16} /> Refresh queue</button></section>
             <div className="filter-row"><span>{visiblePosts.length} post(s)</span><span className="filter-note"><ShieldCheck size={15} /> No automatic publishing</span></div>
             {loading ? <Loading /> : visiblePosts.length === 0 ? <div className="panel"><Empty title="No posts to display" text="Create a campaign to generate LinkedIn and Facebook drafts." /><button className="primary-button centered-button" onClick={() => setShowForm(true)}><Plus size={17} /> Create campaign</button></div> :
-              <div className="draft-grid">{[...visiblePosts].reverse().map((post) => <DraftCard key={post.post_id} post={post} busy={busy === post.post_id} onReview={reviewPost} />)}</div>}
+              <div className="draft-grid">{[...visiblePosts].reverse().map((post) => <DraftCard key={post.post_id} post={post} busy={busy === post.post_id} onReview={reviewPost} onPublish={publishPost} />)}</div>}
           </>}
         </div>
         <footer className="footer"><span>SLIMES.HUSTLERS AI SOLUTIONS</span><span><span className="status-dot" /> Private workspace · Human approval required</span></footer>
@@ -383,10 +403,10 @@ function platformName(platform) {
   return platform === 'linkedin' ? 'LinkedIn' : 'Facebook';
 }
 
-function StatusBadge({ status }) {
+function StatusBadge({ status, published }) {
   const config = {
     PENDING_APPROVAL: ['pending', 'Pending review'],
-    APPROVED: ['approved', 'Approved'],
+    APPROVED: [published ? 'approved' : 'approved', published ? 'Published' : 'Approved'],
     REJECTED: ['rejected', 'Rejected'],
   }[status] || ['pending', status];
   return <span className={`status-badge ${config[0]}`}><span />{config[1]}</span>;
@@ -397,7 +417,7 @@ function CampaignRow({ campaign, posts }) {
   return <div className="campaign-row"><div className="campaign-symbol"><Activity size={19} /></div><div className="campaign-details"><strong>{campaign.name}</strong><small>{campaign.objective}</small><span>{campaign.campaign_id}</span></div><div className="campaign-platforms">{['linkedin', 'facebook'].map((platform) => <PlatformIcon key={platform} platform={platform} />)}</div><div className="campaign-count"><strong>{campaignPosts.length}</strong><small>drafts</small></div></div>;
 }
 
-function DraftCard({ post, busy, onReview }) {
+function DraftCard({ post, busy, onReview, onPublish }) {
   return (
     <article className="draft-card">
       <div className="draft-card-top">
@@ -408,7 +428,7 @@ function DraftCard({ post, busy, onReview }) {
             <small>Social content draft</small>
           </div>
         </div>
-        <StatusBadge status={post.status} />
+        <StatusBadge status={post.status} published={Boolean(post.external_post_id)} />
       </div>
 
       <div className="generation-row">
@@ -461,10 +481,25 @@ function DraftCard({ post, busy, onReview }) {
         </div>
       )}
 
+      {post.status === 'APPROVED' && post.platform === 'facebook' && !post.external_post_id && (
+        <div className="draft-actions">
+          <button
+            className="publish-button"
+            disabled={busy}
+            onClick={() => onPublish(post)}
+          >
+            {busy ? <LoaderCircle size={16} className="spin" /> : <Send size={16} />}
+            Publish to Facebook
+          </button>
+        </div>
+      )}
+
       {post.status !== 'PENDING_APPROVAL' && (
         <div className="reviewed-note">
           <ShieldCheck size={15} />
-          Reviewed · {post.status.toLowerCase()}
+          {post.external_post_id
+            ? `Published to Facebook · ${post.external_post_id}`
+            : `Reviewed · ${post.status.toLowerCase()}`}
         </div>
       )}
     </article>

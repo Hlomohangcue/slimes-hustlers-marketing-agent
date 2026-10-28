@@ -1,3 +1,4 @@
+import json
 import pytest
 from fastapi.testclient import TestClient
 import asyncio
@@ -5,6 +6,9 @@ import os
 import subprocess
 import sys
 from types import SimpleNamespace
+from urllib import error
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 os.environ["APP_ENV"] = "development"
 
@@ -57,6 +61,7 @@ def test_health_endpoint():
     ("POST", "/campaigns/CMP-UNKNOWN/drafts"),
     ("GET", "/posts"),
     ("POST", "/posts/PST-UNKNOWN/approve"),
+    ("POST", "/posts/PST-UNKNOWN/publish/facebook"),
     ("POST", "/posts/PST-UNKNOWN/reject"),
 ])
 def test_every_protected_route_rejects_missing_or_invalid_auth(method, path):
@@ -193,6 +198,216 @@ def test_reject_post_and_prevent_second_review():
 def test_unknown_post_returns_404():
     response = client.post("/posts/unknown/approve")
     assert response.status_code == 404
+
+
+def test_facebook_post_must_be_approved_before_explicit_publishing():
+    campaign = create_test_campaign()
+    posts = client.post(f"/campaigns/{campaign['campaign_id']}/drafts").json()
+    facebook = next(post for post in posts if post["platform"] == "facebook")
+
+    response = client.post(f"/posts/{facebook['post_id']}/publish/facebook")
+
+    assert response.status_code == 409
+    assert "approved" in response.json()["detail"].lower()
+
+
+def test_facebook_publishing_posts_approved_content_once(monkeypatch):
+    campaign = create_test_campaign()
+    posts = client.post(f"/campaigns/{campaign['campaign_id']}/drafts").json()
+    facebook = next(post for post in posts if post["platform"] == "facebook")
+    client.post(f"/posts/{facebook['post_id']}/approve")
+    monkeypatch.setenv("FACEBOOK_PAGE_ID", "123456")
+    monkeypatch.setenv("FACEBOOK_PAGE_ACCESS_TOKEN", "test-page-token")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def getcode(self):
+            return 200
+
+        def read(self):
+            return b'{"id":"123456_789012"}'
+
+    def fake_urlopen(http_request, timeout):
+        assert timeout == 20
+        assert http_request.full_url == "https://graph.facebook.com/v26.0/123456/feed"
+        assert http_request.method == "POST"
+        assert http_request.get_header("Authorization") == "Bearer test-page-token"
+        assert http_request.get_header("Content-type") == "application/json"
+        assert json.loads(http_request.data.decode()) == {"message": facebook["content"]}
+        assert "test-page-token" not in http_request.full_url
+        return FakeResponse()
+
+    monkeypatch.setattr(service.request, "urlopen", fake_urlopen)
+
+    response = client.post(f"/posts/{facebook['post_id']}/publish/facebook")
+
+    assert response.status_code == 200
+    assert response.json()["external_post_id"] == "123456_789012"
+    assert response.json()["published_at"] is not None
+
+    duplicate = client.post(f"/posts/{facebook['post_id']}/publish/facebook")
+    assert duplicate.status_code == 409
+    assert "already been published" in duplicate.json()["detail"]
+
+
+def test_facebook_publishing_fails_closed_when_configuration_is_missing(monkeypatch):
+    campaign = create_test_campaign()
+    posts = client.post(f"/campaigns/{campaign['campaign_id']}/drafts").json()
+    facebook = next(post for post in posts if post["platform"] == "facebook")
+    client.post(f"/posts/{facebook['post_id']}/approve")
+    monkeypatch.delenv("FACEBOOK_PAGE_ID", raising=False)
+    monkeypatch.delenv("FACEBOOK_PAGE_ACCESS_TOKEN", raising=False)
+
+    response = client.post(f"/posts/{facebook['post_id']}/publish/facebook")
+
+    assert response.status_code == 503
+    assert "not configured" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize("status", ["PENDING_APPROVAL", "REJECTED"])
+def test_facebook_publishing_rejects_unpublishable_status(status):
+    campaign = create_test_campaign()
+    posts = client.post(f"/campaigns/{campaign['campaign_id']}/drafts").json()
+    facebook = next(post for post in posts if post["platform"] == "facebook")
+    if status == "REJECTED":
+        client.post(f"/posts/{facebook['post_id']}/reject")
+
+    response = client.post(f"/posts/{facebook['post_id']}/publish/facebook")
+
+    assert response.status_code == 409
+    assert "approved" in response.json()["detail"].lower()
+
+
+def test_facebook_publishing_rejects_linkedin_posts(monkeypatch):
+    campaign = create_test_campaign()
+    posts = client.post(f"/campaigns/{campaign['campaign_id']}/drafts").json()
+    linkedin = next(post for post in posts if post["platform"] == "linkedin")
+    client.post(f"/posts/{linkedin['post_id']}/approve")
+    monkeypatch.setenv("FACEBOOK_PAGE_ID", "123456")
+    monkeypatch.setenv("FACEBOOK_PAGE_ACCESS_TOKEN", "test-page-token")
+
+    response = client.post(f"/posts/{linkedin['post_id']}/publish/facebook")
+
+    assert response.status_code == 409
+    assert "facebook posts" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_detail"),
+    [
+        (error.HTTPError("https://graph.facebook.com", 403, "forbidden", {}, None),
+         "facebook rejected or could not accept"),
+        (TimeoutError("timed out"), "facebook rejected or could not accept"),
+        (error.URLError("network unavailable"), "facebook rejected or could not accept"),
+    ],
+)
+def test_facebook_publish_network_and_api_failures_are_safe(
+    monkeypatch, failure, expected_detail
+):
+    campaign = create_test_campaign()
+    posts = client.post(f"/campaigns/{campaign['campaign_id']}/drafts").json()
+    facebook = next(post for post in posts if post["platform"] == "facebook")
+    client.post(f"/posts/{facebook['post_id']}/approve")
+    monkeypatch.setenv("FACEBOOK_PAGE_ID", "123456")
+    monkeypatch.setenv("FACEBOOK_PAGE_ACCESS_TOKEN", "test-page-token")
+
+    def fail(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(service.request, "urlopen", fail)
+
+    response = client.post(f"/posts/{facebook['post_id']}/publish/facebook")
+
+    assert response.status_code == 502
+    assert expected_detail in response.json()["detail"].lower()
+    assert "test-page-token" not in str(response.json())
+    assert client.get("/posts").json()[0]["external_post_id"] is None
+
+
+@pytest.mark.parametrize("body", [b"{}", b"[]", b'{"id":""}', b'{"id":"bad id"}'])
+def test_facebook_publish_requires_valid_success_identifier(monkeypatch, body):
+    campaign = create_test_campaign()
+    posts = client.post(f"/campaigns/{campaign['campaign_id']}/drafts").json()
+    facebook = next(post for post in posts if post["platform"] == "facebook")
+    client.post(f"/posts/{facebook['post_id']}/approve")
+    monkeypatch.setenv("FACEBOOK_PAGE_ID", "123456")
+    monkeypatch.setenv("FACEBOOK_PAGE_ACCESS_TOKEN", "test-page-token")
+
+    class InvalidResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def getcode(self):
+            return 200
+
+        def read(self):
+            return body
+
+    monkeypatch.setattr(service.request, "urlopen", lambda *_args, **_kwargs: InvalidResponse())
+
+    response = client.post(f"/posts/{facebook['post_id']}/publish/facebook")
+
+    assert response.status_code == 502
+    assert client.get("/posts").json()[0]["external_post_id"] is None
+
+
+def test_concurrent_facebook_publish_requests_only_call_meta_once(monkeypatch):
+    campaign = create_test_campaign()
+    posts = client.post(f"/campaigns/{campaign['campaign_id']}/drafts").json()
+    facebook = next(post for post in posts if post["platform"] == "facebook")
+    client.post(f"/posts/{facebook['post_id']}/approve")
+    monkeypatch.setenv("FACEBOOK_PAGE_ID", "123456")
+    monkeypatch.setenv("FACEBOOK_PAGE_ACCESS_TOKEN", "test-page-token")
+    entered = Event()
+    release = Event()
+    calls = 0
+
+    class ConcurrentResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def getcode(self):
+            return 200
+
+        def read(self):
+            return b'{"id":"123456_789012"}'
+
+    def concurrent_urlopen(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        assert release.wait(timeout=5)
+        return ConcurrentResponse()
+
+    monkeypatch.setattr(service.request, "urlopen", concurrent_urlopen)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            client.post, f"/posts/{facebook['post_id']}/publish/facebook"
+        )
+        assert entered.wait(timeout=5)
+        second = executor.submit(
+            client.post, f"/posts/{facebook['post_id']}/publish/facebook"
+        )
+        second_response = second.result(timeout=5)
+        release.set()
+        first_response = first.result(timeout=5)
+
+    assert second_response.status_code == 409
+    assert "already being published" in second_response.json()["detail"]
+    assert first_response.status_code == 200
+    assert calls == 1
 
 
 def test_gemini_generator_returns_ai_content(monkeypatch):

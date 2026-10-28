@@ -1,11 +1,36 @@
-﻿import os
+﻿import json
+import os
+import re
 import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib import parse, request
+from urllib.parse import urlsplit
 from src.marketing.ai_generator import generate_ai_draft
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "marketing.db"
+DEFAULT_FACEBOOK_GRAPH_API = "https://graph.facebook.com/v26.0"
+PUBLISH_IN_PROGRESS = "FACEBOOK_PUBLISH_IN_PROGRESS"
+
+
+class FacebookConfigurationError(RuntimeError):
+    pass
+
+
+class FacebookPublishError(RuntimeError):
+    pass
+
+
+def _clear_facebook_publish_claim(post_id: str) -> None:
+    with _connect() as connection:
+        connection.execute(
+            """
+            UPDATE posts SET publication_error = NULL
+            WHERE post_id = ? AND publication_error = ?
+            """,
+            (post_id, PUBLISH_IN_PROGRESS),
+        )
 
 
 def _connect() -> sqlite3.Connection:
@@ -36,6 +61,9 @@ def _connect() -> sqlite3.Connection:
             status TEXT NOT NULL CHECK(
                 status IN ('PENDING_APPROVAL', 'APPROVED', 'REJECTED')
             ) DEFAULT 'PENDING_APPROVAL',
+            external_post_id TEXT,
+            published_at TEXT,
+            publication_error TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             reviewed_at TEXT
         );
@@ -53,7 +81,9 @@ def _connect() -> sqlite3.Connection:
             ADD COLUMN generation_source TEXT NOT NULL DEFAULT 'template'
             """
         )
-        connection.commit()
+    for column in ("external_post_id", "published_at", "publication_error"):
+        if column not in columns:
+            connection.execute(f"ALTER TABLE posts ADD COLUMN {column} TEXT")
 
     connection.commit()
     return connection
@@ -238,3 +268,133 @@ def approve_post(post_id: str) -> dict[str, Any]:
 
 def reject_post(post_id: str) -> dict[str, Any]:
     return _review_post(post_id, "REJECTED")
+
+
+def _facebook_api_endpoint(api_base: str, page_id: str) -> str:
+    parsed = urlsplit(api_base)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "graph.facebook.com"
+        or parsed.port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or not re.fullmatch(r"/v[0-9]+(?:\.[0-9]+)?", parsed.path)
+    ):
+        raise FacebookConfigurationError("FACEBOOK_GRAPH_API_BASE is invalid.")
+    return f"{api_base.rstrip('/')}/{parse.quote(page_id, safe='')}/feed"
+
+
+def _facebook_publishing_config() -> tuple[str, str, str, int]:
+    page_id = os.getenv("FACEBOOK_PAGE_ID", "").strip()
+    access_token = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "").strip()
+    api_base = os.getenv("FACEBOOK_GRAPH_API_BASE", DEFAULT_FACEBOOK_GRAPH_API)
+    try:
+        timeout_ms = int(os.getenv("FACEBOOK_PUBLISH_TIMEOUT_MS", "20000") or "20000")
+    except ValueError as exc:
+        raise FacebookConfigurationError("FACEBOOK_PUBLISH_TIMEOUT_MS must be an integer.") from exc
+    if not page_id or not access_token:
+        raise FacebookConfigurationError("Facebook publishing is not configured.")
+    if not page_id.isdecimal():
+        raise FacebookConfigurationError("FACEBOOK_PAGE_ID must be numeric.")
+    if not 1_000 <= timeout_ms <= 60_000:
+        raise FacebookConfigurationError(
+            "FACEBOOK_PUBLISH_TIMEOUT_MS must be between 1000 and 60000."
+        )
+    return page_id, access_token, _facebook_api_endpoint(api_base, page_id), timeout_ms
+
+
+def publish_facebook_post(post_id: str) -> dict[str, Any]:
+    with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT * FROM posts WHERE post_id = ?", (post_id,)
+        ).fetchone()
+        if row is None:
+            raise LookupError("Post not found.")
+        if row["platform"] != "facebook":
+            raise ValueError("Only Facebook posts can be published through this endpoint.")
+        if row["status"] != "APPROVED":
+            raise ValueError("Only approved Facebook posts can be published.")
+        if row["external_post_id"]:
+            raise ValueError("This post has already been published to Facebook.")
+        if row["publication_error"] == PUBLISH_IN_PROGRESS:
+            raise ValueError("This post is already being published to Facebook.")
+
+    _page_id, access_token, endpoint, timeout_ms = _facebook_publishing_config()
+
+    with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        current = connection.execute(
+            """
+            SELECT * FROM posts WHERE post_id = ? AND status = 'APPROVED'
+              AND platform = 'facebook' AND external_post_id IS NULL
+              AND publication_error IS NOT ?
+            """,
+            (post_id, PUBLISH_IN_PROGRESS),
+        ).fetchone()
+        if current is None:
+            raise ValueError("This post is no longer eligible for Facebook publishing.")
+        connection.execute(
+            """
+            UPDATE posts SET publication_error = ?
+            WHERE post_id = ? AND status = 'APPROVED'
+              AND platform = 'facebook' AND external_post_id IS NULL
+              AND publication_error IS NOT ?
+            """,
+            (PUBLISH_IN_PROGRESS, post_id, PUBLISH_IN_PROGRESS),
+        )
+        connection.commit()
+
+    try:
+        payload = json.dumps({"message": row["content"]}).encode("utf-8")
+        http_request = request.Request(
+            endpoint,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with request.urlopen(http_request, timeout=timeout_ms / 1000) as response:
+            status = response.getcode()
+            if status is not None and not 200 <= status < 300:
+                raise FacebookPublishError("Facebook rejected the post.")
+            result = json.loads(response.read().decode("utf-8"))
+    except FacebookPublishError:
+        _clear_facebook_publish_claim(post_id)
+        raise
+    except (request.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+        _clear_facebook_publish_claim(post_id)
+        raise FacebookPublishError("Facebook rejected or could not accept the post.") from exc
+
+    if not isinstance(result, dict):
+        _clear_facebook_publish_claim(post_id)
+        raise FacebookPublishError("Facebook returned an invalid publish response.")
+    external_post_id = str(result.get("id", "")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]+", external_post_id):
+        _clear_facebook_publish_claim(post_id)
+        raise FacebookPublishError("Facebook did not return a valid published post identifier.")
+
+    with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        updated = connection.execute(
+            """
+            UPDATE posts
+            SET external_post_id = ?, published_at = CURRENT_TIMESTAMP,
+                publication_error = NULL
+            WHERE post_id = ? AND status = 'APPROVED'
+              AND platform = 'facebook' AND external_post_id IS NULL
+              AND publication_error = ?
+            """,
+            (external_post_id, post_id, PUBLISH_IN_PROGRESS),
+        )
+        if updated.rowcount != 1:
+            raise FacebookPublishError("Facebook publishing state changed unexpectedly.")
+        connection.commit()
+        result_row = connection.execute(
+            "SELECT * FROM posts WHERE post_id = ?", (post_id,)
+        ).fetchone()
+    return _dict(result_row) or {}

@@ -109,9 +109,11 @@
 .draft-content { min-height: 185px; max-height: 300px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.85; color: #d3d3d7; font-size: 12px; padding: 18px 0; margin-top: 15px; border-top: 1px solid #29292d; }
 .draft-meta { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 7px; border-top: 1px solid #29292d; padding-top: 12px; color: #7f7f86; font-size: 9px; }
 .draft-actions { display: flex; gap: 9px; margin-top: 16px; }
-.approve-button, .reject-button { flex: 1; display: flex; align-items: center; justify-content: center; gap: 7px; border-radius: 8px; padding: 10px; font-size: 11px; font-weight: 600; }
+.approve-button, .reject-button, .publish-button { flex: 1; display: flex; align-items: center; justify-content: center; gap: 7px; border-radius: 8px; padding: 10px; font-size: 11px; font-weight: 600; }
 .approve-button { color: #081c13; background: #65d2a2; border: 1px solid #65d2a2; }
 .approve-button:hover { background: #83e0b7; }
+.publish-button { color: #f4f7ff; background: #1877f2; border: 1px solid #1877f2; }
+.publish-button:hover { background: #3c8bf5; }
 .reject-button { color: #ff9292; background: #ff77770c; border: 1px solid #663b3b; }
 .reject-button:hover { background: #ff77771c; }
 .reviewed-note { display: flex; align-items: center; gap: 7px; margin-top: 15px; padding-top: 13px; border-top: 1px solid #29292d; color: #aaaab1; font-size: 10px; }

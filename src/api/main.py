@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from pydantic import BaseModel, Field
 
+
 from src.marketing.service import (
     approve_post,
     create_campaign,
@@ -15,6 +16,9 @@ from src.marketing.service import (
     get_campaign,
     list_campaigns,
     list_posts,
+    publish_facebook_post,
+    FacebookConfigurationError,
+    FacebookPublishError,
     reject_post,
 )
 
@@ -281,6 +285,20 @@ def approve_post_endpoint(post_id: str, _: None = Depends(require_auth)) -> dict
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/posts/{post_id}/publish/facebook")
+def publish_facebook_post_endpoint(post_id: str, _: None = Depends(require_auth)) -> dict:
+    try:
+        return publish_facebook_post(post_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except FacebookConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except FacebookPublishError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/posts/{post_id}/reject")

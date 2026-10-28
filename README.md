@@ -3,8 +3,9 @@
 A single-user campaign planning and content drafting application for
 Slimes.Hustlers AI Solutions. The application stores campaign/post data in
 SQLite and keeps an explicit human review step before any post is approved.
-Approval does not publish content, and this version has no social publishing
-integration.
+Approval gates content for an explicit second publishing action. Facebook
+publishing is opt-in and requires server credentials; LinkedIn drafting remains
+draft-only.
 
 ## Local setup
 
@@ -21,9 +22,26 @@ Copy-Item .env.example .env
 Set `APP_ENV=development` and `MARKETING_AUTH_SECRET` in `.env`. The secret
 must be private and randomly generated, with at least 32 bytes. For example,
 generate one with `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
-Do not commit `.env` or put this value in any `VITE_*` variable. Set
-`MARKETING_AI_ENABLED=true` and provide `GEMINI_API_KEY` only if Gemini drafting
-is wanted.
+Do not commit `.env` or expose its values through frontend `VITE_*` variables.
+Set `MARKETING_AI_ENABLED=true` and provide `GEMINI_API_KEY` only if Gemini
+drafting is wanted.
+
+The API reads configuration from process environment variables; it does not
+load `.env` automatically. Load the private root `.env` file into the current
+PowerShell process before starting the API:
+
+```powershell
+Get-Content .\.env | ForEach-Object {
+    if ($_ -match '^\s*([^#=\s]+)\s*=\s*(.*)\s*$') {
+        $name = $Matches[1]
+        $value = $Matches[2].Trim().Trim('"').Trim("'")
+        [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+    }
+}
+```
+
+The snippet sets environment variables in memory without printing secret
+values. Repeat this loading step in each new terminal that starts the API.
 
 Run the API:
 
@@ -59,7 +77,27 @@ them without authorization.
 | `GEMINI_API_KEY` | If AI enabled | Server-side Gemini credential. Keep it out of frontend variables. |
 | `GEMINI_MODEL` | No | Gemini model name. |
 | `GEMINI_TIMEOUT_MS` | No | Per-generation network timeout, bounded to 1,000–60,000 ms; default 20,000. |
+| `FACEBOOK_PAGE_ID` | Facebook publishing | Numeric Meta Page ID used for explicit publishing. |
+| `FACEBOOK_PAGE_ACCESS_TOKEN` | Facebook publishing | Server-side Page access token with permission to publish feed posts. Never place this in a `VITE_*` variable. |
+| `FACEBOOK_PUBLISH_TIMEOUT_MS` | No | Per-publish network timeout, bounded to 1,000–60,000 ms; default 20,000. |
+| `FACEBOOK_GRAPH_API_BASE` | No | HTTPS Graph API base URL; defaults to the current `https://graph.facebook.com/v26.0`. Must use the `graph.facebook.com` host and a `vN` or `vN.N` path. |
 | `VITE_API_BASE_URL` | Production frontend build | Public API URL compiled into the frontend; production build requires a valid absolute HTTPS URL and rejects localhost/loopback. Never place credentials or secrets in any `VITE_*` variable. |
+
+### Facebook publishing
+
+Facebook publishing is deliberately not automatic. Create a draft, select
+**Approve draft**, then select **Publish to Facebook** for that approved draft.
+The server posts the exact approved content to the configured Page through
+Meta's Graph API and stores the returned external post ID to prevent duplicate
+publishing. Configure `FACEBOOK_PAGE_ID` and `FACEBOOK_PAGE_ACCESS_TOKEN` only
+on the server. Use a Page access token for the target Page. Meta requires the
+user/Page relationship to have `CREATE_CONTENT` task access and the app grant
+for `pages_manage_posts` (plus `pages_manage_metadata`,
+`pages_manage_read_engagement`, and `pages_show_list` for discovery as described
+by Meta). Obtain the Page ID and token from `/me/accounts`; do not rely on a
+personal-profile token. Meta permissions require App Review when the app is live,
+and development-mode access is limited to app roles. Rotate or revoke the token
+using Meta when no longer needed.
 
 The Vite development default is `http://127.0.0.1:8765`. `frontend/.env.example`
 shows the local value. For a production frontend build, set `VITE_API_BASE_URL`

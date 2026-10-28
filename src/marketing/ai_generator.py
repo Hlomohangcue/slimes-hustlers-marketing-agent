@@ -4,13 +4,11 @@ import os
 import threading
 from typing import Any
 
-from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
 logger = logging.getLogger(__name__)
 
-load_dotenv()
 _generation_slots = threading.BoundedSemaphore(2)
 
 
