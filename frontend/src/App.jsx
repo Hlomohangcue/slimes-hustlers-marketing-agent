@@ -1,10 +1,21 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Activity, ArrowUpRight, Bot, Check, CheckCircle2,
       ChevronRight, CircleAlert, Clock3, LayoutDashboard, 
       LoaderCircle, Plus, RefreshCw, Send, ShieldCheck, Sparkles,
       X, XCircle, Zap } from "lucide-react";
 import './App.css';
+import { formatApiError } from './apiErrors.js';
 import { createSessionEpoch, resolveForSession } from './sessionEpoch.js';
+import {
+  createCampaignWithDrafts,
+  DraftGenerationError,
+  getDraftGenerationFailureMessage,
+} from './campaignCreation.js';
+import {
+  approveAndPublishFacebook,
+  publishFacebook,
+  requiresFacebookOutcomeVerification,
+} from './facebookPublishing.js';
 
 const API = import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.PROD ? '/api' : 'http://127.0.0.1:8765');
 
@@ -21,6 +32,11 @@ function App() {
   const [notice, setNotice] = useState('');
   const [showForm, setShowForm] = useState(false);
   const [busy, setBusy] = useState('');
+  const [busyReviewAction, setBusyReviewAction] = useState('');
+  const actionInFlight = useRef(false);
+  const campaignRefreshId = useRef(0);
+  const postsRefreshId = useRef(0);
+  const refreshId = useRef(0);
   const [form, setForm] = useState({
     name: '', objective: '', audience: '', offer: '',
     call_to_action: 'Contact Slimes.Hustlers to learn more',
@@ -59,6 +75,7 @@ function App() {
       setPosts([]);
       setShowForm(false);
       setBusy('');
+      setBusyReviewAction('');
       setLoading(false);
       throw new Error('Your session expired or was rejected. Please log in again.');
     }
@@ -67,7 +84,7 @@ function App() {
       throw new Error('Your session changed. Please sign in again.');
     }
     if (!response.ok) {
-      throw new Error(data.detail || `Request failed (${response.status})`);
+      throw new Error(formatApiError(data.detail, response.status));
     }
     return data;
   }, [renderGeneration, sessionEpoch, token]);
@@ -75,7 +92,9 @@ function App() {
   const refresh = useCallback(async () => {
     const generation = renderGeneration;
     if (!sessionEpoch.isCurrent(generation)) return;
-    setLoading(true);
+    const currentRefreshId = ++refreshId.current;
+    const currentCampaignRefreshId = ++campaignRefreshId.current;
+    const currentPostsRefreshId = ++postsRefreshId.current;
     setError('');
     try {
       const result = await resolveForSession(sessionEpoch, generation, Promise.all([
@@ -84,52 +103,42 @@ function App() {
       ]));
       if (!result.current) return;
       const [campaignData, postData] = result.value;
-      setCampaigns(campaignData);
-      setPosts(postData);
-    } catch (err) {
-      if (sessionEpoch.isCurrent(generation)) setError(err.message);
-    } finally {
-      if (sessionEpoch.isCurrent(generation)) setLoading(false);
-    }
-  }, [renderGeneration, request, sessionEpoch]);
-
-  
-useEffect(() => {
-  if (!token) return undefined;
-  const generation = sessionEpoch.current();
-  let cancelled = false;
-
-  async function loadInitialData() {
-    try {
-      const result = await resolveForSession(sessionEpoch, generation, Promise.all([
-        request('/campaigns'),
-        request('/posts'),
-      ]));
-
-      if (!cancelled && result.current) {
-        const [campaignData, postData] = result.value;
+      if (currentCampaignRefreshId === campaignRefreshId.current) {
         setCampaigns(campaignData);
+      }
+      if (currentPostsRefreshId === postsRefreshId.current) {
         setPosts(postData);
       }
+      return {
+        campaigns: campaignData,
+        posts: currentPostsRefreshId === postsRefreshId.current ? postData : null,
+      };
     } catch (err) {
-      if (!cancelled && sessionEpoch.isCurrent(generation)) {
-        setError(
-          err.message
-        );
+      if (
+        sessionEpoch.isCurrent(generation)
+        && currentRefreshId === refreshId.current
+      ) {
+        setError(err.message);
       }
+      return null;
     } finally {
-      if (!cancelled && sessionEpoch.isCurrent(generation)) {
+      if (
+        sessionEpoch.isCurrent(generation)
+        && currentRefreshId === refreshId.current
+      ) {
         setLoading(false);
       }
     }
-  }
+  }, [renderGeneration, request, sessionEpoch]);
 
-  void loadInitialData();
-
-  return () => {
-    cancelled = true;
-  };
-}, [request, sessionEpoch, token]);
+  useEffect(() => {
+    if (!token) return undefined;
+    async function loadInitialData() {
+      await refresh();
+    }
+    void loadInitialData();
+    return undefined;
+  }, [refresh, token]);
 
   async function login(event) {
     event.preventDefault();
@@ -168,6 +177,7 @@ useEffect(() => {
     setPosts([]);
     setShowForm(false);
     setBusy('');
+    setBusyReviewAction('');
     setLoading(false);
     setError('');
     setNotice('');
@@ -193,13 +203,12 @@ const templateCount = posts.filter(
     setBusy('create');
     setError('');
     try {
-      const campaign = await request('/campaigns', {
-        method: 'POST',
-        body: JSON.stringify(form),
-      });
-      if (!sessionEpoch.isCurrent(generation)) return;
-      await request(`/campaigns/${campaign.campaign_id}/drafts`, {
-        method: 'POST',
+      await createCampaignWithDrafts(form, request, (campaign) => {
+        campaignRefreshId.current += 1;
+        setCampaigns((current) => [
+          campaign,
+          ...current.filter((item) => item.campaign_id !== campaign.campaign_id),
+        ]);
       });
       if (!sessionEpoch.isCurrent(generation)) return;
       setNotice('Campaign created. LinkedIn and Facebook drafts are ready for review.');
@@ -211,7 +220,21 @@ const templateCount = posts.filter(
       setPage('Drafts');
       await refresh();
     } catch (err) {
-      if (sessionEpoch.isCurrent(generation)) setError(err.message);
+      if (!sessionEpoch.isCurrent(generation)) return;
+      if (err instanceof DraftGenerationError) {
+        setForm({
+          name: '', objective: '', audience: '', offer: '',
+          call_to_action: 'Contact Slimes.Hustlers to learn more',
+        });
+        setShowForm(false);
+        setPage('Campaigns');
+        await refresh();
+        if (sessionEpoch.isCurrent(generation)) {
+          setNotice(getDraftGenerationFailureMessage(err.campaign));
+        }
+      } else {
+        setError(err.message);
+      }
     } finally {
       if (sessionEpoch.isCurrent(generation)) setBusy('');
     }
@@ -219,39 +242,85 @@ const templateCount = posts.filter(
 
   async function publishPost(post) {
     const generation = renderGeneration;
-    if (!sessionEpoch.isCurrent(generation)) return;
+    if (!sessionEpoch.isCurrent(generation) || actionInFlight.current) return;
+    actionInFlight.current = true;
     setBusy(post.post_id);
     setError('');
     setNotice('');
     try {
-      const published = await request(`/posts/${post.post_id}/publish/facebook`, {
-        method: 'POST',
-      });
+      const published = await publishFacebook(post, request);
       if (!sessionEpoch.isCurrent(generation)) return;
       setNotice(`Facebook post published successfully (ID: ${published.external_post_id}).`);
       await refresh();
     } catch (err) {
       if (sessionEpoch.isCurrent(generation)) setError(err.message);
     } finally {
-      if (sessionEpoch.isCurrent(generation)) setBusy('');
+      actionInFlight.current = false;
+      if (sessionEpoch.isCurrent(generation)) {
+        setBusy('');
+        setBusyReviewAction('');
+      }
     }
+  }
+
+  async function saveDraftEdit(post, content, version) {
+    const updated = await request(`/posts/${post.post_id}/draft`, {
+      method: 'PATCH',
+      body: JSON.stringify({ content, version }),
+    });
+    postsRefreshId.current += 1;
+    setPosts((current) =>
+      current.map((item) => item.post_id === updated.post_id
+        ? item.version > updated.version ? item : updated
+        : item),
+    );
+    setNotice('Draft saved. It remains pending approval.');
+    return updated;
+  }
+
+  async function reloadDraft(postId) {
+    const result = await refresh();
+    const latest = result?.posts?.find((post) => post.post_id === postId);
+    if (!latest) {
+      throw new Error('Could not reload the latest draft. Try refreshing again.');
+    }
+    return latest;
   }
 
   async function reviewPost(post, action) {
     const generation = renderGeneration;
-    if (!sessionEpoch.isCurrent(generation)) return;
+    if (!sessionEpoch.isCurrent(generation) || actionInFlight.current) return;
+    actionInFlight.current = true;
     setBusy(post.post_id);
+    setBusyReviewAction(action);
     setError('');
     setNotice('');
     try {
-      await request(`/posts/${post.post_id}/${action}`, { method: 'POST' });
-      if (!sessionEpoch.isCurrent(generation)) return;
-      setNotice(`Post ${action === 'approve' ? 'approved' : 'rejected'} successfully.`);
+      if (action === 'approve' && post.platform === 'facebook') {
+        const published = await approveAndPublishFacebook(post, request);
+        if (!sessionEpoch.isCurrent(generation)) return;
+        setNotice(`Facebook post published successfully (ID: ${published.external_post_id}).`);
+      } else {
+        await request(`/posts/${post.post_id}/${action}`, { method: 'POST' });
+        if (!sessionEpoch.isCurrent(generation)) return;
+        setNotice(`Post ${action === 'approve' ? 'approved' : 'rejected'} successfully.`);
+      }
       await refresh();
     } catch (err) {
-      if (sessionEpoch.isCurrent(generation)) setError(err.message);
+      if (!sessionEpoch.isCurrent(generation)) return;
+      try {
+        await refresh();
+      } catch {
+        // The original approval/publishing error is more actionable than a
+        // secondary dashboard refresh failure.
+      }
+      setError(err.message);
     } finally {
-      if (sessionEpoch.isCurrent(generation)) setBusy('');
+      actionInFlight.current = false;
+      if (sessionEpoch.isCurrent(generation)) {
+        setBusy('');
+        setBusyReviewAction('');
+      }
     }
   }
 
@@ -351,7 +420,7 @@ const templateCount = posts.filter(
               </div>
             </section>
 
-            <section className="human-control-banner"><div className="shield-icon"><ShieldCheck size={24} /></div><div><strong>Human approval is always in control</strong><p>Drafts are not published automatically. Approve a Facebook draft first, then publish it with a separate explicit action.</p></div><span className="banner-pill"><Check size={14} /> Approval gate active</span></section>
+            <section className="human-control-banner"><div className="shield-icon"><ShieldCheck size={24} /></div><div><strong>Human approval is always in control</strong><p>Drafts are not published automatically. Approving a Facebook draft explicitly approves and publishes it; LinkedIn remains approval-only.</p></div><span className="banner-pill"><Check size={14} /> Approval gate active</span></section>
           </>}
 
           {page === 'Campaigns' && <>
@@ -365,7 +434,7 @@ const templateCount = posts.filter(
             <section className="welcome-row"><div><div className="eyebrow"><ShieldCheck size={14} /> HUMAN REVIEW QUEUE</div><h1>Every post, <span className="gold">your decision.</span></h1><p>Review content before it can be considered for publishing.</p></div><button className="secondary-button" onClick={refresh}><RefreshCw size={16} /> Refresh queue</button></section>
             <div className="filter-row"><span>{visiblePosts.length} post(s)</span><span className="filter-note"><ShieldCheck size={15} /> No automatic publishing</span></div>
             {loading ? <Loading /> : visiblePosts.length === 0 ? <div className="panel"><Empty title="No posts to display" text="Create a campaign to generate LinkedIn and Facebook drafts." /><button className="primary-button centered-button" onClick={() => setShowForm(true)}><Plus size={17} /> Create campaign</button></div> :
-              <div className="draft-grid">{[...visiblePosts].reverse().map((post) => <DraftCard key={post.post_id} post={post} busy={busy === post.post_id} onReview={reviewPost} onPublish={publishPost} />)}</div>}
+              <div className="draft-grid">{[...visiblePosts].reverse().map((post) => <DraftCard key={post.post_id} post={post} busy={busy === post.post_id} busyReviewAction={busy === post.post_id ? busyReviewAction : ''} onReview={reviewPost} onPublish={publishPost} onSaveEdit={saveDraftEdit} onReloadLatest={reloadDraft} />)}</div>}
           </>}
         </div>
         <footer className="footer"><span>SLIMES.HUSTLERS AI SOLUTIONS</span><span><span className="status-dot" /> Private workspace · Human approval required</span></footer>
@@ -417,7 +486,61 @@ function CampaignRow({ campaign, posts }) {
   return <div className="campaign-row"><div className="campaign-symbol"><Activity size={19} /></div><div className="campaign-details"><strong>{campaign.name}</strong><small>{campaign.objective}</small><span>{campaign.campaign_id}</span></div><div className="campaign-platforms">{['linkedin', 'facebook'].map((platform) => <PlatformIcon key={platform} platform={platform} />)}</div><div className="campaign-count"><strong>{campaignPosts.length}</strong><small>drafts</small></div></div>;
 }
 
-function DraftCard({ post, busy, onReview, onPublish }) {
+function DraftCard({
+  post,
+  busy,
+  busyReviewAction,
+  onReview,
+  onPublish,
+  onSaveEdit,
+  onReloadLatest,
+}) {
+  const [editing, setEditing] = useState(false);
+  const [editContent, setEditContent] = useState(post.content);
+  const [editVersion, setEditVersion] = useState(post.version);
+  const [editError, setEditError] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  function startEditing() {
+    setEditContent(post.content);
+    setEditVersion(post.version);
+    setEditError('');
+    setEditing(true);
+  }
+
+  async function reloadLatest() {
+    setSaving(true);
+    setEditError('');
+    try {
+      const latest = await onReloadLatest(post.post_id);
+      setEditContent(latest.content);
+      setEditVersion(latest.version);
+    } catch (error) {
+      setEditError(error.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveEdit(event) {
+    event.preventDefault();
+    if (!editContent.trim()) {
+      setEditError('Draft content cannot be empty.');
+      return;
+    }
+
+    setSaving(true);
+    setEditError('');
+    try {
+      await onSaveEdit(post, editContent, editVersion);
+      setEditing(false);
+    } catch (error) {
+      setEditError(error.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <article className="draft-card">
       <div className="draft-card-top">
@@ -444,21 +567,61 @@ function DraftCard({ post, busy, onReview, onPublish }) {
         </span>
       </div>
 
-      <div className="draft-content">{post.content}</div>
+      {editing ? (
+        <form className="draft-edit-form" onSubmit={saveEdit}>
+          <label>
+            Edit draft content
+            <textarea
+              aria-label="Edit draft content"
+              maxLength={10000}
+              value={editContent}
+              onChange={(event) => {
+                setEditContent(event.target.value);
+                setEditError('');
+              }}
+            />
+          </label>
+          {editError && <div className="alert error-alert" role="alert">{editError}</div>}
+          <div className="draft-meta">
+            <span>Editing version {editVersion}</span>
+            {post.version !== editVersion && <span>Latest loaded version {post.version}</span>}
+          </div>
+          <div className="draft-actions">
+            <button type="button" className="secondary-button" disabled={saving} onClick={() => setEditing(false)}>
+              Cancel
+            </button>
+            <button type="button" className="secondary-button" disabled={saving} onClick={reloadLatest}>
+              Reload latest version
+            </button>
+            <button type="submit" className="primary-button" disabled={saving}>
+              {saving ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />}
+              Save draft
+            </button>
+          </div>
+        </form>
+      ) : (
+        <div className="draft-content">{post.content}</div>
+      )}
 
       <div className="draft-meta">
         <span>ID: {post.post_id}</span>
         <span>{post.created_at}</span>
+        <span>Version {post.version}</span>
       </div>
 
       {post.status === 'PENDING_APPROVAL' && (
         <div className="draft-actions">
+          {!editing && (
+            <button className="secondary-button" disabled={busy} onClick={startEditing}>
+              Edit draft
+            </button>
+          )}
           <button
             className="reject-button"
-            disabled={busy}
+            disabled={busy || editing}
             onClick={() => onReview(post, 'reject')}
           >
-            {busy ? (
+            {busy && busyReviewAction === 'reject' ? (
               <LoaderCircle size={16} className="spin" />
             ) : (
               <X size={16} />
@@ -468,20 +631,23 @@ function DraftCard({ post, busy, onReview, onPublish }) {
 
           <button
             className="approve-button"
-            disabled={busy}
+            disabled={busy || editing}
             onClick={() => onReview(post, 'approve')}
           >
-            {busy ? (
+            {busy && busyReviewAction === 'approve' ? (
               <LoaderCircle size={16} className="spin" />
             ) : (
               <Check size={16} />
             )}
-            Approve draft
+            {post.platform === 'facebook' ? 'Approve & publish' : 'Approve draft'}
           </button>
         </div>
       )}
 
-      {post.status === 'APPROVED' && post.platform === 'facebook' && !post.external_post_id && (
+      {post.status === 'APPROVED'
+        && post.platform === 'facebook'
+        && !post.external_post_id
+        && !requiresFacebookOutcomeVerification(post) && (
         <div className="draft-actions">
           <button
             className="publish-button"
@@ -499,7 +665,9 @@ function DraftCard({ post, busy, onReview, onPublish }) {
           <ShieldCheck size={15} />
           {post.external_post_id
             ? `Published to Facebook · ${post.external_post_id}`
-            : `Reviewed · ${post.status.toLowerCase()}`}
+            : requiresFacebookOutcomeVerification(post)
+              ? 'Publication outcome uncertain · Verify this post on Facebook before retrying'
+              : `Reviewed · ${post.status.toLowerCase()}`}
         </div>
       )}
     </article>
