@@ -19,7 +19,11 @@ from src.marketing.service import (
     publish_facebook_post,
     FacebookConfigurationError,
     FacebookPublishError,
+    DraftEditConflictError,
+    DraftEditNotAllowedError,
+    ReviewPersistenceError,
     reject_post,
+    update_post_draft,
 )
 
 DEVELOPMENT_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
@@ -121,8 +125,9 @@ async def lifespan(_app):
 app = FastAPI(
     title="Slimes.Hustlers Marketing Agent",
     description=(
-        "Marketing campaign drafts and human approval workflow. "
-        "This version does not publish to social media."
+        "Marketing campaign planning, content drafting, and human review. "
+        "Facebook publishing is available only after approval. "
+        "LinkedIn publishing is not currently supported."
     ),
     version="0.1.0",
     docs_url=None if APP_ENV == "production" else "/docs",
@@ -238,6 +243,11 @@ class CampaignCreate(BaseModel):
     )
 
 
+class DraftUpdate(BaseModel):
+    content: str = Field(min_length=1, max_length=10_000, strict=True)
+    version: int = Field(ge=1, strict=True)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "marketing-agent"}
@@ -277,6 +287,20 @@ def list_posts_endpoint(campaign_id: str | None = None, _: None = Depends(requir
     return list_posts(campaign_id)
 
 
+@app.patch("/posts/{post_id}/draft")
+def update_post_draft_endpoint(
+    post_id: str, payload: DraftUpdate, _: None = Depends(require_auth)
+) -> dict:
+    try:
+        return update_post_draft(post_id, payload.content, payload.version)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (DraftEditConflictError, DraftEditNotAllowedError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.post("/posts/{post_id}/approve")
 def approve_post_endpoint(post_id: str, _: None = Depends(require_auth)) -> dict:
     try:
@@ -285,6 +309,10 @@ def approve_post_endpoint(post_id: str, _: None = Depends(require_auth)) -> dict
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ReviewPersistenceError as exc:
+        raise HTTPException(
+            status_code=500, detail="Review action could not be saved."
+        ) from exc
 
 
 @app.post("/posts/{post_id}/publish/facebook")
@@ -309,3 +337,7 @@ def reject_post_endpoint(post_id: str, _: None = Depends(require_auth)) -> dict:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ReviewPersistenceError as exc:
+        raise HTTPException(
+            status_code=500, detail="Review action could not be saved."
+        ) from exc

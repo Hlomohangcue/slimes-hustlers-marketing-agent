@@ -85,11 +85,20 @@ them without authorization.
 
 ### Facebook publishing
 
-Facebook publishing is deliberately not automatic. Create a draft, select
-**Approve draft**, then select **Publish to Facebook** for that approved draft.
-The server posts the exact approved content to the configured Page through
+Facebook publishing is deliberately opt-in. Creating a Facebook draft and
+explicitly selecting **Approve & publish** approves it and then immediately
+publishes it through a separate server-side publishing request. LinkedIn
+drafts remain approval-only. The server posts the exact approved content to
+the configured Page through
 Meta's Graph API and stores the returned external post ID to prevent duplicate
-publishing. Configure `FACEBOOK_PAGE_ID` and `FACEBOOK_PAGE_ACCESS_TOKEN` only
+publishing.
+
+A confirmed HTTP 4xx rejection may be retried after the cause is corrected,
+provided the backend permits it. Timeouts, network failures, HTTP 5xx
+responses, invalid responses, and database-save failures can leave the outcome
+uncertain. For such outcomes, check the Facebook Page and reconcile the database
+state before retrying; never assume that an uncertain outcome failed or
+succeeded. Configure `FACEBOOK_PAGE_ID` and `FACEBOOK_PAGE_ACCESS_TOKEN` only
 on the server. Use a Page access token for the target Page. Meta requires the
 user/Page relationship to have `CREATE_CONTENT` task access and the app grant
 for `pages_manage_posts` (plus `pages_manage_metadata`,
@@ -98,6 +107,55 @@ by Meta). Obtain the Page ID and token from `/me/accounts`; do not rely on a
 personal-profile token. Meta permissions require App Review when the app is live,
 and development-mode access is limited to app roles. Rotate or revoke the token
 using Meta when no longer needed.
+
+#### Recovering an interrupted Facebook publish
+
+The API does not automatically recover `FACEBOOK_PUBLISH_IN_PROGRESS` claims.
+An interrupted request may have reached Facebook even if the local process
+never received or saved the response. Do not clear a claim based only on its
+age, restart the publish request, or assume that a missing post in a quick Page
+check proves that Facebook did not publish it.
+
+For a claim that remains in progress after the publishing process has stopped:
+
+1. Stop the API and confirm no API worker is still running. Do not perform
+   recovery while the database is being used.
+2. Make and verify a separate, access-controlled copy of the SQLite database
+   before inspecting or changing it. Keep the original unchanged as a recovery
+   copy.
+3. Inspect the single affected row by `post_id`, confirming its campaign,
+   platform, approval status, content, external post ID, publication timestamp,
+   and `publication_error`. The expected state is an approved Facebook post,
+   no external ID, and `FACEBOOK_PUBLISH_IN_PROGRESS`.
+4. Manually check the configured Facebook Page for a post matching the exact
+   approved content and the relevant time. Record the operator, time, post ID,
+   evidence checked, and decision in the pilot's operational incident record;
+   the application does not keep per-user recovery audit history.
+5. If the matching post is found, record its exact Facebook post ID and
+   confirmed publication time in the database, and clear the in-progress
+   marker in one transaction. Restrict the update to the exact `post_id` and
+   expected in-progress state, and verify exactly one row changed. Do not
+   replace an existing external ID or alter the approved content.
+6. If non-publication is conclusively established through authoritative
+   verification, clear the in-progress marker for that exact row in one
+   transaction, only while its external ID is still empty and its state is
+   still `FACEBOOK_PUBLISH_IN_PROGRESS`. Verify exactly one row changed. A
+   missing result in a limited or delayed Page view is not conclusive evidence.
+   Only after this documented human decision may an operator use the normal
+   explicit publishing action once.
+7. If neither publication nor non-publication can be established, leave the
+   row unchanged and blocked. Escalate for further verification; never clear
+   the marker or retry to see what happens.
+8. Restart the API only after the database change has been checked and
+   committed. Read the post through the authenticated API and confirm its
+   external ID and state. Do not issue a publish request for a row with an
+   external ID or an unresolved outcome.
+
+This is a manual database recovery procedure, not an application feature. Use
+an SQLite client and transaction handling appropriate to the deployment, and
+preserve the pre-recovery copy. If the database cannot be safely edited or the
+verification is uncertain, keep publishing disabled for that post and obtain
+assistance rather than retrying.
 
 The Vite development default is `http://127.0.0.1:8765`. `frontend/.env.example`
 shows the local value. For a production frontend build, set `VITE_API_BASE_URL`
@@ -138,13 +196,54 @@ variable names are present.
 
 ### SQLite backup and restore
 
-Stop the API before making a file copy so SQLite has no active writes. Copy the
-database file from the mounted volume to encrypted, access-controlled backup
-storage. To restore, stop the API, preserve the current database as a separate
-recovery copy, put the selected backup at `MARKETING_DB_PATH`, verify file
-ownership/permissions, then start the API and check `/health` and authenticated
-campaign/post reads. Retain backups according to the pilot's data-retention
-policy. Do not restore over a running database.
+The application does not configure SQLite's journal mode; verify the mode used
+by the deployed database rather than assuming it. When SQLite uses write-ahead
+logging (WAL), committed changes may still be in the `-wal` sidecar, while
+`-shm` supports coordination between database connections. Copying only the
+main `.db` file may therefore omit committed changes. Do not copy a live
+database file as a backup.
+
+Prefer SQLite's online backup API to create a consistent snapshot while the
+database is open. Store backups in encrypted, access-controlled storage, and
+restrict access because they contain campaign and post data. Validate each
+backup before relying on it:
+
+1. Run `PRAGMA integrity_check` and require exactly `ok`.
+2. Run `PRAGMA foreign_key_check` and require zero rows.
+3. Verify that the expected application tables, indexes, constraints, and
+   campaign, post, and review-audit data are present.
+4. Record the backup time and validation result without exposing database
+   contents in logs or reports.
+
+For an offline restore or file replacement, stop all API instances and workers
+and confirm that no other process has an open connection. Preserve the current
+database as a separate rollback copy before proceeding. Restore the selected
+backup into a new temporary database on the same volume as `MARKETING_DB_PATH`;
+do not overwrite the active database during restore. Close all SQLite
+connections, validate the staged database using the checks above, and confirm
+the expected application schema and data before replacing the configured
+database.
+
+Before replacement, account for SQLite sidecars. After a clean shutdown, verify
+that no stale `-wal` or `-shm` files can be applied to the replacement. Do not
+delete sidecars while a process may have the database open; if their state is
+unclear, stop and obtain SQLite-aware assistance. Replace the active file only
+after validation succeeds and all connections are closed, while preserving the
+rollback copy. If any step fails, do not activate the staged file; retain the
+current database and investigate.
+
+After replacement, verify file ownership and permissions, then start only the
+intended API instance and worker configuration. Check `/health` and perform
+authenticated campaign and post reads. If startup or application checks fail,
+stop all API workers and restore the preserved rollback copy using the same
+staged and validated process.
+
+Production-specific journal mode, API replica/worker count, persistent storage
+mapping, backup retention, encryption controls, recovery point objective
+(RPO), and recovery time objective (RTO) must be verified or agreed for the
+deployment; this repository does not establish those operational facts or
+guarantees. Do not restore or replace the database while any API connection
+may remain open.
 
 ## Checks
 
@@ -157,6 +256,8 @@ python -m pytest -q
 From `frontend`:
 
 ```powershell
+npm run test
+npm run test:component
 npm run lint
 $env:VITE_API_BASE_URL = 'https://api.example.invalid'
 npm run build
