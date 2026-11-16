@@ -28,3 +28,16 @@ test('formats array validation details with each field location and message', ()
     'Request failed (422): body.name: Field required; body.audience: String should have at most 300 characters',
   )
 })
+
+test('formats the structured API error envelope with field errors and request ID', () => {
+  assert.equal(
+    formatApiError({
+      code: 'VALIDATION_ERROR',
+      message: 'Request validation failed.',
+      field_errors: [
+        { field: 'body.name', message: 'Field required' },
+      ],
+    }, 422, 'request-123'),
+    'Request failed (422): Request validation failed. body.name: Field required (request ID: request-123)',
+  )
+})

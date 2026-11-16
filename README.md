@@ -65,6 +65,38 @@ you out. `/health` is public; all campaign and post routes require the bearer
 token. API docs at `/docs` describe protected operations but cannot execute
 them without authorization.
 
+## API errors and request IDs
+
+Every HTTP response includes a server-generated `X-Request-ID` header. The
+server does not trust or echo a client-supplied request ID. Error responses use
+this structure:
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Request validation failed.",
+    "field_errors": [
+      {
+        "field": "body.name",
+        "code": "string_too_short",
+        "message": "String should have at least 1 character"
+      }
+    ]
+  },
+  "request_id": "server-generated-uuid",
+  "detail": "Request validation failed."
+}
+```
+
+`error.code` is stable for programmatic handling; `error.message` is safe for
+display. `field_errors` is present only for request validation failures and
+contains no submitted values. The top-level `detail` field remains as a
+compatibility alias for existing clients. Request logs include the request ID
+and safe request metadata, not request bodies, credentials, or provider
+payloads. For cross-origin development clients, `X-Request-ID` is exposed by
+CORS so it can be read by the browser.
+
 ## Configuration
 
 | Variable | Required | Purpose |

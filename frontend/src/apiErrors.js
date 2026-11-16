@@ -21,9 +21,21 @@ function formatDetail(detail) {
   return '';
 }
 
-export function formatApiError(detail, status) {
-  const formattedDetail = formatDetail(detail);
-  return formattedDetail
-    ? `Request failed (${status}): ${formattedDetail}`
-    : `Request failed (${status})`;
+export function formatApiError(detail, status, requestId) {
+  const message = detail && typeof detail === 'object' && !Array.isArray(detail)
+    ? formatDetail(detail.message) || formatDetail(detail)
+    : formatDetail(detail);
+  const fieldErrors = Array.isArray(detail?.field_errors)
+    ? detail.field_errors
+      .map((error) => [error.field, error.message].filter(Boolean).join(': '))
+      .filter(Boolean)
+      .join('; ')
+    : '';
+  const details = [message, fieldErrors].filter(Boolean).join(' ');
+  const request = typeof requestId === 'string' && requestId.trim()
+    ? ` (request ID: ${requestId.trim()})`
+    : '';
+  return details
+    ? `Request failed (${status}): ${details}${request}`
+    : `Request failed (${status})${request}`;
 }
