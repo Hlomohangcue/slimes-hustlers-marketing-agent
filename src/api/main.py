@@ -1,12 +1,20 @@
 ﻿from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 import hmac
 import ipaddress
+import json
+import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from urllib.parse import urlsplit
+from uuid import uuid4
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
 from src.marketing.service import (
@@ -26,6 +34,21 @@ from src.marketing.service import (
     update_post_draft,
 )
 
+logger = logging.getLogger(__name__)
+HTTP_ERROR_CODES = {
+    400: "BAD_REQUEST",
+    401: "UNAUTHORIZED",
+    403: "FORBIDDEN",
+    404: "NOT_FOUND",
+    405: "METHOD_NOT_ALLOWED",
+    409: "CONFLICT",
+    413: "REQUEST_TOO_LARGE",
+    422: "VALIDATION_ERROR",
+    429: "RATE_LIMITED",
+    500: "INTERNAL_SERVER_ERROR",
+    502: "UPSTREAM_ERROR",
+    503: "SERVICE_UNAVAILABLE",
+}
 DEVELOPMENT_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
 APP_ENV = os.getenv("APP_ENV", "").strip().lower()
 if APP_ENV not in {"development", "production"}:
@@ -137,23 +160,186 @@ app = FastAPI(
 )
 
 
+class APIError(HTTPException):
+    def __init__(self, status_code: int, code: str, message: str):
+        super().__init__(status_code=status_code, detail=message)
+        self.code = code
+
+
+def _error_response(
+    request_id: str,
+    status_code: int,
+    code: str,
+    message: str,
+    field_errors: list[dict[str, str]] | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    error: dict[str, object] = {"code": code, "message": message}
+    if field_errors:
+        error["field_errors"] = field_errors
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": error,
+            "request_id": request_id,
+            "detail": message,
+        },
+        headers=headers,
+    )
+
+
+def _request_id(request: Request) -> str:
+    return request.state.request_id
+
+
+@app.exception_handler(StarletteHTTPException)
+async def handle_http_exception(
+    request: Request, exc: StarletteHTTPException
+) -> JSONResponse:
+    code = getattr(
+        exc,
+        "code",
+        HTTP_ERROR_CODES.get(exc.status_code, "HTTP_ERROR"),
+    )
+    message = exc.detail if isinstance(exc.detail, str) else "The request could not be completed."
+    request.state.error_code = code
+    return _error_response(
+        _request_id(request),
+        exc.status_code,
+        code,
+        message,
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_validation_exception(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    field_errors = []
+    for error in exc.errors():
+        location = ".".join(str(part) for part in error.get("loc", ()))
+        field_errors.append({
+            "field": location or "$",
+            "code": str(error.get("type", "invalid_value")),
+            "message": str(error.get("msg", "Invalid value.")),
+        })
+    request.state.error_code = "VALIDATION_ERROR"
+    return _error_response(
+        _request_id(request),
+        422,
+        "VALIDATION_ERROR",
+        "Request validation failed.",
+        field_errors=field_errors,
+    )
+
+
+class RequestCorrelationMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request_id = str(uuid4())
+        state = scope.setdefault("state", {})
+        state["request_id"] = request_id
+        response_status = 500
+        response_started = False
+        started_at = perf_counter()
+
+        async def send_correlated(message):
+            nonlocal response_status, response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+                response_status = message["status"]
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() != b"x-request-id"
+                ]
+                headers.append((b"x-request-id", request_id.encode("ascii")))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_correlated)
+        except Exception:
+            state["error_code"] = "INTERNAL_SERVER_ERROR"
+            response_status = 500
+            if not response_started:
+                response = _error_response(
+                    request_id,
+                    500,
+                    "INTERNAL_SERVER_ERROR",
+                    "An unexpected error occurred. Provide the request ID when contacting support.",
+                )
+                await response(scope, receive, send_correlated)
+        finally:
+            route = scope.get("route")
+            operation = getattr(route, "path", "unmatched")
+            error_code = state.get("error_code")
+            if response_status >= 500:
+                level = logging.ERROR
+                error_code = error_code or "INTERNAL_SERVER_ERROR"
+            elif response_status >= 400:
+                level = logging.WARNING
+            else:
+                level = logging.INFO
+            event = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "event": "http_request",
+                "request_id": request_id,
+                "workspace_id": None,
+                "operation": operation,
+                "provider": "facebook" if operation.endswith("/publish/facebook") else None,
+                "method": scope.get("method"),
+                "status_code": response_status,
+                "outcome": "failure" if response_status >= 400 else "success",
+                "error_code": error_code,
+                "duration_ms": round((perf_counter() - started_at) * 1000, 2),
+            }
+            logger.log(
+                level,
+                json.dumps(event, separators=(",", ":"), sort_keys=True),
+            )
+
+
 def require_auth(authorization: str | None = Header(default=None)) -> None:
     try:
         validate_runtime_config()
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail="Production configuration is invalid.") from exc
+        raise APIError(
+            status_code=503,
+            code="SERVER_CONFIGURATION_ERROR",
+            message="Production configuration is invalid.",
+        ) from exc
     secret = os.getenv("MARKETING_AUTH_SECRET", "")
     if len(secret.encode("utf-8")) < 32:
-        raise HTTPException(status_code=503, detail="Authentication is not configured.")
+        raise APIError(
+            status_code=503,
+            code="AUTHENTICATION_UNAVAILABLE",
+            message="Authentication is not configured.",
+        )
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Authentication required.")
+        raise APIError(
+            status_code=401,
+            code="AUTHENTICATION_REQUIRED",
+            message="Authentication required.",
+        )
     supplied = authorization[7:]
     if (
         not supplied
         or len(supplied) > 4096
         or not hmac.compare_digest(supplied.encode("utf-8"), secret.encode("utf-8"))
     ):
-        raise HTTPException(status_code=401, detail="Invalid or expired session.")
+        raise APIError(
+            status_code=401,
+            code="AUTHENTICATION_INVALID",
+            message="Invalid or expired session.",
+        )
 
 
 class RequestBodyLimitMiddleware:
@@ -175,10 +361,10 @@ class RequestBodyLimitMiddleware:
         if content_length is not None:
             try:
                 if int(content_length) > self.max_body_size:
-                    await self._reject(send)
+                    await self._reject(send, scope)
                     return
             except ValueError:
-                await self._reject(send)
+                await self._reject(send, scope)
                 return
 
         body = bytearray()
@@ -188,7 +374,7 @@ class RequestBodyLimitMiddleware:
                 return
             chunk = message.get("body", b"")
             if len(body) + len(chunk) > self.max_body_size:
-                await self._reject(send)
+                await self._reject(send, scope)
                 return
             body.extend(chunk)
             if not message.get("more_body", False):
@@ -206,8 +392,18 @@ class RequestBodyLimitMiddleware:
 
         await self.app(scope, bounded_receive, send)
 
-    async def _reject(self, send):
-        body = b'{"detail":"Request body too large."}'
+    async def _reject(self, send, scope):
+        state = scope.setdefault("state", {})
+        request_id = state.setdefault("request_id", str(uuid4()))
+        state["error_code"] = "REQUEST_TOO_LARGE"
+        body = json.dumps({
+            "error": {
+                "code": "REQUEST_TOO_LARGE",
+                "message": "Request body too large.",
+            },
+            "request_id": request_id,
+            "detail": "Request body too large.",
+        }).encode("utf-8")
         await send({
             "type": "http.response.start",
             "status": 413,
@@ -230,7 +426,9 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["Content-Type", "Authorization"],
+    expose_headers=["X-Request-ID"],
 )
+app.add_middleware(RequestCorrelationMiddleware)
 
 
 class CampaignCreate(BaseModel):
@@ -258,7 +456,7 @@ def create_campaign_endpoint(payload: CampaignCreate, _: None = Depends(require_
     try:
         return create_campaign(**payload.model_dump())
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise APIError(422, "CAMPAIGN_VALIDATION_ERROR", str(exc)) from exc
 
 
 @app.get("/campaigns")
@@ -270,7 +468,7 @@ def list_campaigns_endpoint(_: None = Depends(require_auth)) -> list[dict]:
 def get_campaign_endpoint(campaign_id: str, _: None = Depends(require_auth)) -> dict:
     campaign = get_campaign(campaign_id)
     if campaign is None:
-        raise HTTPException(status_code=404, detail="Campaign not found.")
+        raise APIError(404, "CAMPAIGN_NOT_FOUND", "Campaign not found.")
     return campaign
 
 
@@ -279,7 +477,7 @@ def generate_drafts_endpoint(campaign_id: str, _: None = Depends(require_auth)) 
     try:
         return generate_drafts(campaign_id)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise APIError(404, "CAMPAIGN_NOT_FOUND", str(exc)) from exc
 
 
 @app.get("/posts")
@@ -294,11 +492,11 @@ def update_post_draft_endpoint(
     try:
         return update_post_draft(post_id, payload.content, payload.version)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise APIError(404, "POST_NOT_FOUND", str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise APIError(422, "DRAFT_VALIDATION_ERROR", str(exc)) from exc
     except (DraftEditConflictError, DraftEditNotAllowedError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise APIError(409, "DRAFT_CONFLICT", str(exc)) from exc
 
 
 @app.post("/posts/{post_id}/approve")
@@ -306,12 +504,14 @@ def approve_post_endpoint(post_id: str, _: None = Depends(require_auth)) -> dict
     try:
         return approve_post(post_id)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise APIError(404, "POST_NOT_FOUND", str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise APIError(409, "REVIEW_CONFLICT", str(exc)) from exc
     except ReviewPersistenceError as exc:
-        raise HTTPException(
-            status_code=500, detail="Review action could not be saved."
+        raise APIError(
+            status_code=500,
+            code="REVIEW_PERSISTENCE_FAILED",
+            message="Review action could not be saved.",
         ) from exc
 
 
@@ -320,13 +520,13 @@ def publish_facebook_post_endpoint(post_id: str, _: None = Depends(require_auth)
     try:
         return publish_facebook_post(post_id)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise APIError(404, "POST_NOT_FOUND", str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise APIError(409, "PUBLISH_CONFLICT", str(exc)) from exc
     except FacebookConfigurationError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise APIError(503, "FACEBOOK_CONFIGURATION_ERROR", str(exc)) from exc
     except FacebookPublishError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise APIError(502, "FACEBOOK_PUBLISH_ERROR", str(exc)) from exc
 
 
 @app.post("/posts/{post_id}/reject")
@@ -334,10 +534,12 @@ def reject_post_endpoint(post_id: str, _: None = Depends(require_auth)) -> dict:
     try:
         return reject_post(post_id)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise APIError(404, "POST_NOT_FOUND", str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise APIError(409, "REVIEW_CONFLICT", str(exc)) from exc
     except ReviewPersistenceError as exc:
-        raise HTTPException(
-            status_code=500, detail="Review action could not be saved."
+        raise APIError(
+            status_code=500,
+            code="REVIEW_PERSISTENCE_FAILED",
+            message="Review action could not be saved.",
         ) from exc

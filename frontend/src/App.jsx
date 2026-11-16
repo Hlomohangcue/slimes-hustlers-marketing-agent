@@ -84,7 +84,11 @@ function App() {
       throw new Error('Your session changed. Please sign in again.');
     }
     if (!response.ok) {
-      throw new Error(formatApiError(data.detail, response.status));
+      throw new Error(formatApiError(
+        data.error ?? data.detail,
+        response.status,
+        data.request_id ?? response.headers?.get?.('X-Request-ID'),
+      ));
     }
     return data;
   }, [renderGeneration, sessionEpoch, token]);

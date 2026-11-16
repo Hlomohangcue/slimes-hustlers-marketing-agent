@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import pytest
 from contextlib import closing
 from fastapi.testclient import TestClient
@@ -9,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 from types import SimpleNamespace
+import uuid
 from urllib import error
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event, Lock
@@ -56,6 +58,79 @@ def test_health_endpoint():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+    uuid.UUID(response.headers["x-request-id"])
+
+
+def test_request_id_is_server_generated_instead_of_trusting_client_header():
+    response = client.get("/health", headers={"X-Request-ID": "client-controlled"})
+
+    assert response.status_code == 200
+    assert response.headers["x-request-id"] != "client-controlled"
+    uuid.UUID(response.headers["x-request-id"])
+
+
+def test_separate_requests_receive_different_request_ids():
+    first = client.get("/health")
+    second = client.get("/health")
+
+    assert first.headers["x-request-id"] != second.headers["x-request-id"]
+
+
+def test_validation_error_uses_stable_error_envelope():
+    response = client.post("/campaigns", json={"name": "", "audience": "Pilot users"})
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+    assert payload["error"]["message"] == "Request validation failed."
+    assert payload["request_id"] == response.headers["x-request-id"]
+    fields = {item["field"] for item in payload["error"]["field_errors"]}
+    assert {"body.name", "body.objective"} <= fields
+    assert all("input" not in item and "ctx" not in item for item in payload["error"]["field_errors"])
+
+
+def test_expected_application_error_uses_stable_code():
+    response = client.get("/campaigns/CMP-UNKNOWN")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "CAMPAIGN_NOT_FOUND"
+    assert response.json()["error"]["message"] == "Campaign not found."
+
+
+def test_unexpected_error_is_safe_and_correlated_in_structured_logs(monkeypatch, caplog):
+    def fail_list_campaigns():
+        raise RuntimeError("test-only-secret\nTraceback (sensitive stack)")
+
+    monkeypatch.setattr(api_main, "list_campaigns", fail_list_campaigns)
+    with caplog.at_level(logging.INFO, logger="src.api.main"):
+        response = client.get("/campaigns")
+
+    payload = response.json()
+    request_id = response.headers["x-request-id"]
+    assert response.status_code == 500
+    assert payload["error"]["code"] == "INTERNAL_SERVER_ERROR"
+    assert payload["request_id"] == request_id
+    assert "test-only-secret" not in response.text
+    assert "Traceback" not in response.text
+    assert "test-only-secret" not in caplog.text
+    assert "Traceback" not in caplog.text
+
+    events = [json.loads(record.getMessage()) for record in caplog.records]
+    request_event = next(event for event in events if event["event"] == "http_request")
+    assert request_event["request_id"] == request_id
+    assert request_event["error_code"] == "INTERNAL_SERVER_ERROR"
+
+
+def test_error_request_id_matches_response_header_and_structured_log(caplog):
+    with caplog.at_level(logging.INFO, logger="src.api.main"):
+        response = client.get("/campaigns/CMP-UNKNOWN")
+
+    payload = response.json()
+    events = [json.loads(record.getMessage()) for record in caplog.records]
+    request_event = next(event for event in events if event["event"] == "http_request")
+    assert payload["request_id"] == response.headers["x-request-id"]
+    assert request_event["request_id"] == response.headers["x-request-id"]
+    assert request_event["error_code"] == "CAMPAIGN_NOT_FOUND"
 
 
 @pytest.mark.parametrize("method,path", [
@@ -125,6 +200,10 @@ def test_cors_allows_development_origin_and_rejects_unlisted_origin():
     assert "origin" in allowed.headers.get("vary", "").lower()
     assert denied.headers.get("access-control-allow-origin") is None
     assert denied.status_code == 400
+    response = client.get("/health", headers={"Origin": "http://localhost:5173"})
+    assert "x-request-id" in response.headers.get(
+        "access-control-expose-headers", ""
+    ).lower()
 
 
 def test_create_campaign_and_list_it():
@@ -1852,7 +1931,11 @@ def run_body_middleware(chunks, headers=()):
             await downstream_send({"type": "http.response.body", "body": b"ok"})
 
         middleware = RequestBodyLimitMiddleware(downstream, max_body_size=32)
-        await middleware({"type": "http", "headers": list(headers)}, receive, send)
+        await middleware(
+            {"type": "http", "headers": list(headers), "state": {"request_id": "test-request-id"}},
+            receive,
+            send,
+        )
         return sent, bytes(downstream_body), receive_calls
 
     return asyncio.run(exercise())
@@ -1877,7 +1960,10 @@ def test_body_limit_rejects_oversized_chunked_or_inaccurate_length(headers):
         {"type": "http.request", "body": b"b" * 13, "more_body": True},
     ], headers)
     assert sent[0]["status"] == 413
-    assert sent[1]["body"] == b'{"detail":"Request body too large."}'
+    payload = json.loads(sent[1]["body"])
+    assert payload["error"]["code"] == "REQUEST_TOO_LARGE"
+    assert payload["detail"] == "Request body too large."
+    assert payload["request_id"] == "test-request-id"
 
 
 def test_body_limit_forwards_normal_sized_json_to_api_route():
@@ -2083,12 +2169,16 @@ def test_body_limit_rejects_chunked_oversize_without_content_length():
             called_app = True
 
         middleware = RequestBodyLimitMiddleware(downstream)
-        await middleware({"type": "http", "headers": []}, receive, send)
+        await middleware(
+            {"type": "http", "headers": [], "state": {"request_id": "test-request-id"}},
+            receive,
+            send,
+        )
         assert not called_app
         assert sent[0]["status"] == 413
-        assert b"".join(message.get("body", b"") for message in sent[1:]) == (
-            b'{"detail":"Request body too large."}'
-        )
+        payload = json.loads(b"".join(message.get("body", b"") for message in sent[1:]))
+        assert payload["error"]["code"] == "REQUEST_TOO_LARGE"
+        assert payload["request_id"] == "test-request-id"
 
     asyncio.run(exercise())
 
