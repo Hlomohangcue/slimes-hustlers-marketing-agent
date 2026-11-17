@@ -64,6 +64,11 @@ screen. The token is held in JavaScript memory only; reloading the page signs
 you out. `/health` is public; all campaign and post routes require the bearer
 token. API docs at `/docs` describe protected operations but cannot execute
 them without authorization.
+The API initializes the SQLite schema and applies legacy migrations during
+startup, before serving requests. `/health` and `/health/live` report process
+liveness; `/health/ready` also checks SQLite connectivity and required schema.
+Readiness checks are read-only and return HTTP 503 with error code
+`DATABASE_NOT_READY` until the database is available.
 
 ## API errors and request IDs
 
@@ -206,10 +211,14 @@ variable names are present.
   Never put server credentials in frontend build variables.
 - `MARKETING_DB_PATH` must be absolute, and its parent directory must already
   exist and be writable at startup. The application cannot verify that the host
-  has mounted durable storage there; verify the volume mapping yourself. The
-  service initializes missing tables; `CREATE TABLE IF NOT EXISTS`
-  preserves an existing database. Ensure the process user can write to the
-  volume and test persistence across a restart before the pilot.
+  has mounted durable storage there; verify the volume mapping yourself.
+  Application startup explicitly initializes missing tables and applies
+  legacy-column migrations before readiness succeeds. Initialization uses a
+  SQLite `BEGIN IMMEDIATE` transaction with a 30-second busy timeout, which
+  serializes schema changes across processes using the same local SQLite file.
+  Ordinary connections do not create or migrate schema; readiness opens the
+  existing file read-only. Ensure the process user can write to the volume and
+  test persistence across a restart before the pilot.
 - Run exactly one API instance with one Uvicorn worker against a SQLite
   database. The Gemini concurrency limit is two calls per Python process.
   Do not share this file across concurrent replicas or network filesystems.

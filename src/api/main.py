@@ -20,8 +20,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from src.marketing.service import (
     approve_post,
     create_campaign,
+    database_is_ready,
     generate_drafts,
     get_campaign,
+    initialize_database,
     list_campaigns,
     list_posts,
     publish_facebook_post,
@@ -29,6 +31,7 @@ from src.marketing.service import (
     FacebookPublishError,
     DraftEditConflictError,
     DraftEditNotAllowedError,
+    DatabaseInitializationError,
     ReviewPersistenceError,
     reject_post,
     update_post_draft,
@@ -142,6 +145,13 @@ def validate_runtime_config() -> None:
 @asynccontextmanager
 async def lifespan(_app):
     validate_runtime_config()
+    try:
+        initialize_database()
+    except DatabaseInitializationError:
+        logger.error(
+            "Database initialization failed; error_code=DATABASE_INITIALIZATION_FAILED"
+        )
+        raise RuntimeError("Database initialization failed.") from None
     yield
 
 
@@ -448,6 +458,22 @@ class DraftUpdate(BaseModel):
 
 @app.get("/health")
 def health() -> dict[str, str]:
+    return {"status": "ok", "service": "marketing-agent"}
+
+
+@app.get("/health/live")
+def health_live() -> dict[str, str]:
+    return {"status": "ok", "service": "marketing-agent"}
+
+
+@app.get("/health/ready")
+def health_ready() -> dict[str, str]:
+    if not database_is_ready():
+        raise APIError(
+            503,
+            "DATABASE_NOT_READY",
+            "The service is not ready to handle requests.",
+        )
     return {"status": "ok", "service": "marketing-agent"}
 
 

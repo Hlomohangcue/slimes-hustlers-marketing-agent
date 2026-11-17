@@ -37,6 +37,7 @@ def isolated_database(tmp_path, monkeypatch):
     monkeypatch.setenv("MARKETING_AUTH_SECRET", TEST_SECRET)
     monkeypatch.setenv("MARKETING_AI_ENABLED", "false")
     monkeypatch.setenv("AI_ENABLED", "false")
+    service.initialize_database()
 
 
 def create_test_campaign():
@@ -57,8 +58,156 @@ def create_test_campaign():
 def test_health_endpoint():
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json()["status"] == "ok"
+    assert response.json() == {"status": "ok", "service": "marketing-agent"}
     uuid.UUID(response.headers["x-request-id"])
+
+
+def test_health_live_does_not_open_database(monkeypatch):
+    def fail_connect(*_args, **_kwargs):
+        raise AssertionError("liveness must not connect to SQLite")
+
+    monkeypatch.setattr(service.sqlite3, "connect", fail_connect)
+
+    response = client.get("/health/live")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "service": "marketing-agent"}
+
+
+def test_health_ready_succeeds_for_initialized_database():
+    response = client.get("/health/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "service": "marketing-agent"}
+
+
+def assert_database_not_ready(response):
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["error"]["code"] == "DATABASE_NOT_READY"
+    assert payload["error"]["message"] == "The service is not ready to handle requests."
+    assert payload["request_id"] == response.headers["x-request-id"]
+    assert "detail" in payload
+
+
+def test_health_ready_missing_database_is_safe_and_does_not_create_path(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "missing-dir" / "marketing.db"
+    monkeypatch.setenv("MARKETING_DB_PATH", str(database_path))
+
+    response = client.get("/health/ready")
+
+    assert_database_not_ready(response)
+    assert not database_path.exists()
+    assert not database_path.parent.exists()
+    assert str(database_path) not in response.text
+
+
+def test_health_ready_unavailable_database_has_correlated_safe_error(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("MARKETING_DB_PATH", str(tmp_path))
+
+    response = client.get("/health/ready")
+
+    assert_database_not_ready(response)
+    assert str(tmp_path) not in response.text
+
+
+def test_health_ready_missing_schema_does_not_repair_database(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "incomplete.db"
+    monkeypatch.setenv("MARKETING_DB_PATH", str(database_path))
+    service.initialize_database()
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute("DROP TABLE post_review_events")
+
+    response = client.get("/health/ready")
+
+    assert_database_not_ready(response)
+    with closing(sqlite3.connect(database_path)) as connection:
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'post_review_events'"
+        ).fetchone() is None
+
+
+def test_health_ready_missing_required_column_does_not_migrate_database(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "missing-column.db"
+    monkeypatch.setenv("MARKETING_DB_PATH", str(database_path))
+    service.initialize_database()
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute(
+            "ALTER TABLE posts RENAME COLUMN version TO legacy_version"
+        )
+
+    response = client.get("/health/ready")
+
+    assert_database_not_ready(response)
+    with closing(sqlite3.connect(database_path)) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(posts)")
+        }
+    assert "version" not in columns
+    assert "legacy_version" in columns
+
+
+def test_health_ready_uses_read_only_connection_and_preserves_data(
+    monkeypatch,
+):
+    original_connect = sqlite3.connect
+    opened = []
+
+    def tracked_connect(database, *args, **kwargs):
+        connection = original_connect(database, *args, **kwargs)
+        statements = []
+        connection.set_trace_callback(statements.append)
+        opened.append((database, kwargs, statements))
+        return connection
+
+    monkeypatch.setattr(service.sqlite3, "connect", tracked_connect)
+    response = client.get("/health/ready")
+
+    assert response.status_code == 200
+    database, options, statements = opened[0]
+    assert "mode=ro" in database
+    assert options["uri"] is True
+    assert "PRAGMA query_only = ON" in statements
+
+
+def test_health_ready_does_not_modify_schema_or_business_data():
+    with service._managed_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO campaigns (
+                campaign_id, name, objective, audience, offer, call_to_action
+            ) VALUES ('CMP-READY001', 'Readiness', 'No mutation', 'Test', '', '')
+            """
+        )
+    with closing(service._connect()) as connection:
+        schema_before = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE type IN ('table', 'index') ORDER BY type, name"
+        ).fetchall()
+        campaigns_before = connection.execute(
+            "SELECT COUNT(*) FROM campaigns"
+        ).fetchone()[0]
+
+    response = client.get("/health/ready")
+
+    assert response.status_code == 200
+    with closing(service._connect()) as connection:
+        assert connection.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE type IN ('table', 'index') ORDER BY type, name"
+        ).fetchall() == schema_before
+        assert connection.execute(
+            "SELECT COUNT(*) FROM campaigns"
+        ).fetchone()[0] == campaigns_before
 
 
 def test_request_id_is_server_generated_instead_of_trusting_client_header():
@@ -217,13 +366,76 @@ def test_create_campaign_and_list_it():
 def test_database_path_creates_parent_and_preserves_existing_campaign(tmp_path, monkeypatch):
     database_path = tmp_path / "mounted-volume" / "marketing.db"
     monkeypatch.setenv("MARKETING_DB_PATH", str(database_path))
+    service.initialize_database()
     original = service.create_campaign("Persistent", "Keep this", "Pilot user")
 
-    # Reopening the configured path initializes idempotently without replacing data.
+    # Reopening an initialized path does not replace existing data.
     with service._connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM campaigns").fetchone()[0] == 1
     assert database_path.exists()
     assert service.get_campaign(original["campaign_id"])["name"] == "Persistent"
+
+
+def test_ordinary_connection_does_not_create_a_missing_database(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "not-initialized.db"
+    monkeypatch.setenv("MARKETING_DB_PATH", str(database_path))
+
+    with pytest.raises(sqlite3.OperationalError):
+        service._connect()
+
+    assert not database_path.exists()
+    database_path.touch()
+    with closing(service._connect()) as connection:
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%'"
+        ).fetchall() == []
+
+
+def test_fresh_database_initializes_explicitly(tmp_path, monkeypatch):
+    database_path = tmp_path / "fresh" / "marketing.db"
+    monkeypatch.setenv("MARKETING_DB_PATH", str(database_path))
+    assert not database_path.exists()
+
+    service.initialize_database()
+
+    assert database_path.is_file()
+    assert service.database_is_ready()
+    with closing(service._connect()) as connection:
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'campaigns'"
+        ).fetchone()["name"] == "campaigns"
+
+
+def test_concurrent_processes_can_initialize_the_same_database(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "concurrent.db"
+    monkeypatch.setenv("MARKETING_DB_PATH", str(database_path))
+    environment = dict(os.environ)
+    script = (
+        "from src.marketing.service import initialize_database; "
+        "initialize_database()"
+    )
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", script],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(4)
+    ]
+
+    for process in processes:
+        _, stderr = process.communicate(timeout=30)
+        assert process.returncode == 0, stderr
+    assert service.database_is_ready()
 
 
 def test_service_operation_commits_and_closes_connection(monkeypatch):
@@ -284,11 +496,13 @@ def test_managed_connection_rolls_back_and_closes_after_exception(monkeypatch):
         ).fetchone()[0] == 0
 
 
-def test_connection_initialization_failure_closes_and_reraises_original(
-    monkeypatch,
+def test_database_initialization_failure_closes_and_hides_sqlite_details(
+    tmp_path, monkeypatch,
 ):
+    database_path = tmp_path / "failed-init.db"
+    monkeypatch.setenv("MARKETING_DB_PATH", str(database_path))
     original_connect = sqlite3.connect
-    initialization_error = RuntimeError("injected schema initialization failure")
+    initialization_error = sqlite3.OperationalError("sensitive path detail")
     connections = []
 
     class FailingInitializationConnection:
@@ -304,31 +518,82 @@ def test_connection_initialization_failure_closes_and_reraises_original(
         def row_factory(self, value):
             self.connection.row_factory = value
 
-        def execute(self, *args, **kwargs):
-            return self.connection.execute(*args, **kwargs)
-
-        def executescript(self, *_args, **_kwargs):
-            raise initialization_error
+        def execute(self, statement, *args, **kwargs):
+            if statement.lstrip().startswith("CREATE TABLE"):
+                raise initialization_error
+            return self.connection.execute(statement, *args, **kwargs)
 
         def close(self):
             self.closed = True
             self.connection.close()
 
-    def failing_connect(database_path):
-        connection = FailingInitializationConnection(original_connect(database_path))
+    def failing_connect(database_path, *args, **kwargs):
+        connection = FailingInitializationConnection(
+            original_connect(database_path, *args, **kwargs)
+        )
         connections.append(connection)
         return connection
 
     monkeypatch.setattr(service.sqlite3, "connect", failing_connect)
 
-    with pytest.raises(RuntimeError) as raised:
-        service._connect()
+    with pytest.raises(service.DatabaseInitializationError) as raised:
+        service.initialize_database()
 
-    assert raised.value is initialization_error
+    assert str(raised.value) == "Database initialization failed."
+    assert "sensitive path detail" not in str(raised.value)
     assert len(connections) == 1
     assert connections[0].closed
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
         connections[0].connection.execute("SELECT 1")
+    with closing(original_connect(database_path)) as verification:
+        assert verification.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%'"
+        ).fetchall() == []
+
+
+def test_initialization_rolls_back_ddl_after_later_schema_failure(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "partial-migration.db"
+    monkeypatch.setenv("MARKETING_DB_PATH", str(database_path))
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute("CREATE VIEW posts AS SELECT 1 AS post_id")
+
+    original_connect = sqlite3.connect
+    statements = []
+
+    def traced_connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(service.sqlite3, "connect", traced_connect)
+
+    with pytest.raises(service.DatabaseInitializationError):
+        service.initialize_database()
+
+    normalized_statements = [
+        statement.lstrip().upper() for statement in statements
+    ]
+    campaigns_ddl = next(
+        index
+        for index, statement in enumerate(normalized_statements)
+        if statement.startswith("CREATE TABLE IF NOT EXISTS CAMPAIGNS")
+    )
+    posts_ddl = next(
+        index
+        for index, statement in enumerate(normalized_statements)
+        if statement.startswith("CREATE TABLE IF NOT EXISTS POSTS")
+    )
+    assert campaigns_ddl < posts_ddl
+
+    with closing(original_connect(database_path)) as verification:
+        objects = verification.execute(
+            "SELECT name, type FROM sqlite_master "
+            "WHERE name IN ('campaigns', 'posts') ORDER BY name"
+        ).fetchall()
+    assert [tuple(row) for row in objects] == [("posts", "view")]
 
 
 def test_legacy_database_initialization_preserves_data_and_is_idempotent(
@@ -406,6 +671,7 @@ def test_legacy_database_initialization_preserves_data_and_is_idempotent(
         ]
         posts_before = [{**post, "version": 1} for post in posts_before]
 
+    service.initialize_database()
     initialized = service._connect()
     try:
         campaigns_after = [
@@ -495,6 +761,7 @@ def test_legacy_database_initialization_preserves_data_and_is_idempotent(
     finally:
         initialized.close()
 
+    service.initialize_database()
     initialized_again = service._connect()
     try:
         assert [
@@ -528,6 +795,159 @@ def test_legacy_database_initialization_preserves_data_and_is_idempotent(
         ]
     finally:
         initialized_again.close()
+
+
+def test_legacy_migration_preserves_published_post_and_is_idempotent(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "legacy-published.db"
+    monkeypatch.setenv("MARKETING_DB_PATH", str(database_path))
+
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executescript(
+            """
+            CREATE TABLE campaigns (
+                campaign_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                audience TEXT NOT NULL,
+                offer TEXT NOT NULL,
+                call_to_action TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE posts (
+                post_id TEXT PRIMARY KEY,
+                campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+                platform TEXT NOT NULL CHECK(platform IN ('linkedin', 'facebook')),
+                content TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(
+                    status IN ('PENDING_APPROVAL', 'APPROVED', 'REJECTED')
+                ) DEFAULT 'PENDING_APPROVAL',
+                external_post_id TEXT,
+                published_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                reviewed_at TEXT
+            );
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO campaigns (
+                campaign_id, name, objective, audience, offer, call_to_action,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "CMP-PUBLISHED001",
+                "Legacy published campaign",
+                "Preserve publication state",
+                "Pilot businesses",
+                "Consultation",
+                "Contact the team",
+                "2026-10-10 09:00:00",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO posts (
+                post_id, campaign_id, platform, content, status,
+                external_post_id, published_at, created_at, reviewed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "PST-PUBLISHED001",
+                "CMP-PUBLISHED001",
+                "facebook",
+                "Approved and published legacy draft",
+                "APPROVED",
+                "facebook-post-12345",
+                "2026-10-10 09:15:00",
+                "2026-10-10 09:05:00",
+                "2026-10-10 09:10:00",
+            ),
+        )
+        connection.commit()
+        campaign_before = dict(
+            connection.execute(
+                "SELECT * FROM campaigns WHERE campaign_id = ?",
+                ("CMP-PUBLISHED001",),
+            ).fetchone()
+        )
+        post_before = dict(
+            connection.execute(
+                "SELECT * FROM posts WHERE post_id = ?",
+                ("PST-PUBLISHED001",),
+            ).fetchone()
+        )
+    finally:
+        connection.close()
+
+    service.initialize_database()
+    with closing(service._connect()) as migrated:
+        campaign_after = dict(
+            migrated.execute(
+                "SELECT * FROM campaigns WHERE campaign_id = ?",
+                ("CMP-PUBLISHED001",),
+            ).fetchone()
+        )
+        post_after = dict(
+            migrated.execute(
+                "SELECT * FROM posts WHERE post_id = ?",
+                ("PST-PUBLISHED001",),
+            ).fetchone()
+        )
+        columns_after = {
+            row["name"]
+            for row in migrated.execute("PRAGMA table_info(posts)").fetchall()
+        }
+        assert campaign_after == campaign_before
+        assert {key: post_after[key] for key in post_before} == post_before
+        assert post_after["status"] == "APPROVED"
+        assert post_after["external_post_id"] == "facebook-post-12345"
+        assert post_after["published_at"] == "2026-10-10 09:15:00"
+        assert service.REQUIRED_SCHEMA_COLUMNS["posts"] <= columns_after
+        assert post_after["generation_source"] == "template"
+        assert post_after["publication_error"] is None
+        assert post_after["version"] == 1
+        schema_after_first_migration = [
+            tuple(row)
+            for row in migrated.execute(
+                "SELECT type, name, sql FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+            ).fetchall()
+        ]
+    assert service.database_is_ready()
+
+    service.initialize_database()
+    with closing(service._connect()) as initialized_again:
+        campaign_after_repeat = dict(
+            initialized_again.execute(
+                "SELECT * FROM campaigns WHERE campaign_id = ?",
+                ("CMP-PUBLISHED001",),
+            ).fetchone()
+        )
+        post_after_repeat = dict(
+            initialized_again.execute(
+                "SELECT * FROM posts WHERE post_id = ?",
+                ("PST-PUBLISHED001",),
+            ).fetchone()
+        )
+        schema_after_repeat = [
+            tuple(row)
+            for row in initialized_again.execute(
+                "SELECT type, name, sql FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+            ).fetchall()
+        ]
+
+    assert campaign_after_repeat == campaign_before
+    assert post_after_repeat == post_after
+    assert schema_after_repeat == schema_after_first_migration
+    assert service.database_is_ready()
 
 
 def test_sqlite_backup_restore_preserves_campaigns_posts_and_review_history(
@@ -603,6 +1023,7 @@ def test_sqlite_backup_restore_preserves_campaigns_posts_and_review_history(
         return table_rows, schema, indexes, foreign_keys
 
     monkeypatch.setenv("MARKETING_DB_PATH", str(source_path))
+    service.initialize_database()
     with closing(service._connect()) as source:
         source.executemany(
             """
@@ -2113,6 +2534,37 @@ def test_production_startup_fails_before_serving_when_configuration_is_invalid(m
     with pytest.raises(RuntimeError, match="MARKETING_AUTH_SECRET"):
         with TestClient(app):
             pass
+
+
+def test_startup_initializes_fresh_database_before_readiness(tmp_path, monkeypatch):
+    database_path = tmp_path / "startup.db"
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("MARKETING_DB_PATH", str(database_path))
+    assert not database_path.exists()
+
+    with TestClient(app) as startup_client:
+        response = startup_client.get("/health/ready")
+
+    assert response.status_code == 200
+    assert database_path.is_file()
+
+
+def test_startup_failure_uses_safe_error_without_internal_details(
+    monkeypatch, caplog
+):
+    internal_detail = "test-only-internal-path"
+
+    def fail_initialization():
+        raise service.DatabaseInitializationError(internal_detail)
+
+    monkeypatch.setattr(api_main, "initialize_database", fail_initialization)
+    with pytest.raises(RuntimeError) as raised:
+        with TestClient(app):
+            pass
+
+    assert str(raised.value) == "Database initialization failed."
+    assert raised.value.__cause__ is None
+    assert internal_detail not in caplog.text
 
 
 def test_backend_import_requires_explicit_app_environment():
