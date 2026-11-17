@@ -17,6 +17,41 @@ DEFAULT_FACEBOOK_GRAPH_API = "https://graph.facebook.com/v26.0"
 PUBLISH_IN_PROGRESS = "FACEBOOK_PUBLISH_IN_PROGRESS"
 PUBLISH_OUTCOME_UNCERTAIN = "FACEBOOK_PUBLISH_OUTCOME_UNCERTAIN"
 MAX_FACEBOOK_ERROR_DETAIL = 240
+SQLITE_BUSY_TIMEOUT_SECONDS = 30
+READINESS_TIMEOUT_SECONDS = 1
+REQUIRED_SCHEMA_COLUMNS = {
+    "campaigns": {
+        "campaign_id",
+        "name",
+        "objective",
+        "audience",
+        "offer",
+        "call_to_action",
+        "created_at",
+    },
+    "posts": {
+        "post_id",
+        "campaign_id",
+        "platform",
+        "content",
+        "generation_source",
+        "status",
+        "external_post_id",
+        "published_at",
+        "publication_error",
+        "created_at",
+        "reviewed_at",
+        "version",
+    },
+    "post_review_events": {
+        "review_event_id",
+        "post_id",
+        "action",
+        "previous_status",
+        "new_status",
+        "reviewed_at",
+    },
+}
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +73,10 @@ class DraftEditConflictError(RuntimeError):
 
 
 class DraftEditNotAllowedError(RuntimeError):
+    pass
+
+
+class DatabaseInitializationError(RuntimeError):
     pass
 
 
@@ -145,14 +184,26 @@ def _facebook_http_error_detail(exc: error.HTTPError, access_token: str) -> str:
     return ". ".join(parts)
 
 
-def _connect() -> sqlite3.Connection:
-    db_path = Path(os.getenv("MARKETING_DB_PATH") or DEFAULT_DB_PATH)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(db_path)
+def _database_path() -> Path:
+    return Path(os.getenv("MARKETING_DB_PATH") or DEFAULT_DB_PATH).resolve()
+
+
+def _sqlite_uri(db_path: Path, mode: str) -> str:
+    return f"{db_path.as_uri()}?mode={mode}"
+
+
+def initialize_database() -> None:
+    connection: sqlite3.Connection | None = None
     try:
+        db_path = _database_path()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(
+            db_path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.executescript(
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in (
             """
             CREATE TABLE IF NOT EXISTS campaigns (
                 campaign_id TEXT PRIMARY KEY,
@@ -162,8 +213,9 @@ def _connect() -> sqlite3.Connection:
                 offer TEXT NOT NULL,
                 call_to_action TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS posts (
                 post_id TEXT PRIMARY KEY,
                 campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
@@ -180,8 +232,9 @@ def _connect() -> sqlite3.Connection:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 reviewed_at TEXT,
                 version INTEGER NOT NULL DEFAULT 1
-            );
-
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS post_review_events (
                 review_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 post_id TEXT NOT NULL REFERENCES posts(post_id),
@@ -191,12 +244,15 @@ def _connect() -> sqlite3.Connection:
                 new_status TEXT NOT NULL
                     CHECK(new_status IN ('APPROVED', 'REJECTED')),
                 reviewed_at TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_post_review_events_post_id
-                ON post_review_events(post_id);
+            )
+            """,
             """
-        )
+            CREATE INDEX IF NOT EXISTS idx_post_review_events_post_id
+                ON post_review_events(post_id)
+            """,
+        ):
+            connection.execute(statement)
+
         columns = {
             row["name"]
             for row in connection.execute("PRAGMA table_info(posts)").fetchall()
@@ -226,6 +282,62 @@ def _connect() -> sqlite3.Connection:
                 )
 
         connection.commit()
+    except (sqlite3.Error, OSError, ValueError):
+        raise DatabaseInitializationError(
+            "Database initialization failed."
+        ) from None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def database_is_ready() -> bool:
+    connection: sqlite3.Connection | None = None
+    try:
+        db_path = _database_path()
+        connection = sqlite3.connect(
+            _sqlite_uri(db_path, "ro"),
+            uri=True,
+            timeout=READINESS_TIMEOUT_SECONDS,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("SELECT 1").fetchone()
+
+        tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        for table, required_columns in REQUIRED_SCHEMA_COLUMNS.items():
+            if table not in tables:
+                return False
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    f'PRAGMA table_info("{table}")'
+                ).fetchall()
+            }
+            if not required_columns.issubset(columns):
+                return False
+        return True
+    except (sqlite3.Error, OSError, ValueError):
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _connect() -> sqlite3.Connection:
+    connection = sqlite3.connect(
+        _sqlite_uri(_database_path(), "rw"),
+        uri=True,
+        timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
+    )
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
         return connection
     except BaseException:
         connection.close()
